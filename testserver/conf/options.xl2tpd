@@ -1,0 +1,62 @@
+# /etc/ppp/options.xl2tpd - pppd options used by the LNS
+#
+# The peer must authenticate; we allow PAP, CHAP-MD5 and MS-CHAPv2 so all
+# three client code paths can be exercised. EAP is refused on purpose.
+
+name L2TPServer
+auth
+refuse-eap
+
+# >>> AUTH-METHODS >>>
+# Which auth protocols we OFFER to the peer in the LCP Configure-Request.
+#
+# IMPORTANT: "auth" on its own makes pppd offer *EAP* first (refuse-eap only
+# governs what we accept when authenticating *to* the peer, not what we
+# offer). Listing the require-* options below removes EAP from the offer and
+# leaves lcp_allowoptions.chap_mdtype = MD5|MS-CHAPv2 with PAP also allowed,
+# so a client can steer us to any of the three with one LCP Configure-Nak.
+#
+# Offer order that results: CHAP-MD5 first (pppd's CHAP_DIGEST() prefers MD5),
+# then MS-CHAPv2 or PAP on Nak.
+#
+# entrypoint.sh rewrites this block when $PPP_AUTH is chap|mschapv2|pap.
+require-chap
+require-mschap-v2
+require-pap
+# <<< AUTH-METHODS <<<
+
+# Compression / VJ off - a from-scratch client should not have to implement
+# them and they make packet traces unreadable.
+noccp
+novj
+novjccomp
+nobsdcomp
+nodeflate
+nopcomp
+noaccomp
+
+# Addressing / DNS push
+ms-dns 10.10.10.1
+ms-dns 8.8.8.8
+ipcp-accept-local
+ipcp-accept-remote
+nodefaultroute
+noipx
+# IPv4 only. pppd would otherwise also start IPV6CP, which a from-scratch
+# IPv4 client has to answer with an LCP Protocol-Reject. Drop this line if
+# you want to exercise that path (a real Livebox does send IPV6CP).
+noipv6
+
+mtu 1400
+mru 1400
+
+lcp-echo-interval 30
+lcp-echo-failure 5
+
+# Retransmit a bit more patiently than the default - useful while a
+# hand-written client is still slow to answer.
+lcp-max-configure 30
+ipcp-max-configure 30
+
+debug
+logfile /var/log/pppd.log
