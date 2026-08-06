@@ -1,0 +1,21 @@
+# Claude workspace
+claude
+session_id
+
+# Gradle / build
+.gradle/
+build/
+*/build/
+.kotlin/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local SDK location
+local.properties
