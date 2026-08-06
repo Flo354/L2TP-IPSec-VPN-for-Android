@@ -1,5 +1,6 @@
 # Claude workspace
 claude
+.claude/
 session_id
 
 # Gradle / build
@@ -19,3 +20,6 @@ captures/
 
 # Local SDK location
 local.properties
+
+# Lab packet captures
+testserver/captures/

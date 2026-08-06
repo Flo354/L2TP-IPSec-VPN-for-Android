@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches MaterialTheme.colorScheme.background in the light Compose palette. -->
+    <color name="window_background">#F4F6F8</color>
+    <color name="ic_launcher_background">#0B1016</color>
+</resources>

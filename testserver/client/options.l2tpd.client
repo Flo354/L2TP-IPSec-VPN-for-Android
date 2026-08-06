@@ -1,0 +1,23 @@
+noauth
+refuse-eap
+noccp
+novj
+novjccomp
+nobsdcomp
+nodeflate
+nopcomp
+noaccomp
+usepeerdns
+nodefaultroute
+noipdefault
+ipcp-accept-local
+ipcp-accept-remote
+mtu 1400
+mru 1400
+lcp-echo-interval 30
+lcp-echo-failure 5
+maxfail 1
+user vpnuser
+password VpnPass123
+debug
+logfile /var/log/pppd-client.log
