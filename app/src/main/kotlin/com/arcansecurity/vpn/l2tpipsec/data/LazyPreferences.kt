@@ -7,12 +7,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-/** An opened store, and whether it turned out to be the encrypted one. */
-internal class OpenedPreferences(
-    val prefs: SharedPreferences,
-    /** `false` when the keystore refused and this is the plaintext fallback. */
-    val encrypted: Boolean,
-)
+/** An opened store. There is only one kind: the keystore-backed one, or nothing. */
+internal class OpenedPreferences(val prefs: SharedPreferences)
 
 /**
  * Opens a [SharedPreferences] exactly once, off the main thread, and hands the same instance to
@@ -25,9 +21,10 @@ internal class OpenedPreferences(
  * show up as a dropped frame or an ANR. Nothing here touches the disk until somebody suspends on
  * [await].
  *
- * [open] is expected to have already dealt with a broken keystore by falling back to a plaintext
- * store; returning `null` from [await] means even that failed, which leaves the app with no
- * persistence at all rather than with an exception thrown out of a constructor.
+ * `null` from [await] means the keystore-backed store could not be opened. There is no fallback by
+ * design, so that is terminal: the store reports [ProfileStoreState.UNREADABLE] and the app refuses
+ * to connect. Returning `null` rather than throwing keeps the failure out of a constructor, where
+ * it would take the process with it.
  */
 internal class LazyPreferences(
     private val io: CoroutineDispatcher,
@@ -45,7 +42,7 @@ internal class LazyPreferences(
             attempted = true
             opened = withContext(io) {
                 runCatching(open).getOrElse {
-                    log.e("No preference store could be opened; nothing will be persisted", it)
+                    log.e("The keystore-backed preference store could not be opened; the app cannot run", it)
                     null
                 }
             }

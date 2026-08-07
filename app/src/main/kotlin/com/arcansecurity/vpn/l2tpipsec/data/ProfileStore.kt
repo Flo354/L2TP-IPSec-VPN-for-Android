@@ -42,14 +42,13 @@ interface ProfileStore {
     /** The profile a connect attempt would use; `null` only when there are none. */
     val activeProfileId: StateFlow<String?>
 
-    val state: StateFlow<ProfileStoreState>
-
     /**
-     * `false` when the platform's encrypted store could not be used and we fell back to plaintext
-     * preferences. The UI must say so: on such a device the pre-shared key and the password sit
-     * unencrypted in the app's private directory.
+     * [ProfileStoreState.UNREADABLE] is terminal: it means the keystore-backed store could not be
+     * opened or could not be decrypted, and there is deliberately no fallback, so the app has
+     * nowhere it is willing to keep a pre-shared key. The UI stops offering to connect and the
+     * service refuses to start.
      */
-    val usesEncryptedStorage: StateFlow<Boolean>
+    val state: StateFlow<ProfileStoreState>
 
     /** Adds [profile], or replaces the one with the same id, keeping its place in the list. */
     suspend fun upsert(profile: VpnProfile)
@@ -116,12 +115,10 @@ internal class PreferenceProfileStore(
     private val _state = MutableStateFlow(ProfileStoreState.LOADING)
 
     /** Optimistic until the store has actually been opened, so no warning flashes during loading. */
-    private val _usesEncryptedStorage = MutableStateFlow(true)
 
     override val profiles: StateFlow<List<VpnProfile>> = _profiles.asStateFlow()
     override val activeProfileId: StateFlow<String?> = _activeProfileId.asStateFlow()
     override val state: StateFlow<ProfileStoreState> = _state.asStateFlow()
-    override val usesEncryptedStorage: StateFlow<Boolean> = _usesEncryptedStorage.asStateFlow()
 
     /** Serialises the load against the mutators, so an early [upsert] cannot be undone by it. */
     private val mutex = Mutex()
@@ -202,11 +199,12 @@ internal class PreferenceProfileStore(
 
     private suspend fun load(store: OpenedPreferences?) {
         if (store == null) {
-            _usesEncryptedStorage.value = false
+            // The keystore-backed store is the only store. Without it there is nowhere to keep a
+            // pre-shared key that we are willing to use, so this is terminal rather than degraded.
+            log.e("No credential store is available; the app cannot hold a profile")
             _state.value = ProfileStoreState.UNREADABLE
             return
         }
-        _usesEncryptedStorage.value = store.encrypted
 
         val stored = try {
             val onDisk = readProfiles(store.prefs, log)
@@ -230,7 +228,7 @@ internal class PreferenceProfileStore(
         // form that opens with "no pre-shared key set" on a profile that has one is a bug report.
         secrets.seedPresence(stored.profiles.map { it.id })
         _state.value = ProfileStoreState.READY
-        log.i("Loaded ${stored.profiles.size} profile(s), encrypted=${store.encrypted}")
+        log.i("Loaded ${stored.profiles.size} profile(s)")
     }
 
     /**

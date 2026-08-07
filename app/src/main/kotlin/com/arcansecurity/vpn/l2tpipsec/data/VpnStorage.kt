@@ -66,7 +66,7 @@ private class Storage(context: Context, logger: VpnLogger) {
         legacySource = {
             // Only interesting when we did get the encrypted store: otherwise it is the very file
             // we are already reading from.
-            if (prefs.await()?.encrypted == true) {
+            if (prefs.await() != null) {
                 context.getSharedPreferences(PLAIN_FILE, Context.MODE_PRIVATE)
             } else {
                 null
@@ -80,27 +80,25 @@ private class Storage(context: Context, logger: VpnLogger) {
 }
 
 /**
- * Opens the keystore-backed store, or the plaintext one when the keystore will not cooperate.
+ * Opens the keystore-backed store. There is deliberately no fallback.
  *
- * Falling back rather than failing is deliberate: the only screen that could fix a broken keystore
- * is the one that would fail to open. See [openEncryptedPreferences] for what is actually being
- * traded away, and note that [ProfileStore.usesEncryptedStorage] carries the bad news to the user.
+ * An earlier version dropped to plaintext preferences when the keystore refused, on the grounds
+ * that the only screen able to fix a broken keystore is the one that would fail to open. That trade
+ * was rejected: it means a pre-shared key and a VPN password sitting unencrypted in the app's data
+ * directory, which is precisely the case the encryption exists for, and a warning banner does not
+ * make it acceptable. If the keystore will not cooperate the app does not run — see
+ * [openEncryptedPreferences] for what it is that would otherwise be given away.
  */
-private fun open(context: Context, log: Log): OpenedPreferences = try {
-    OpenedPreferences(openEncryptedPreferences(context, ENCRYPTED_FILE), encrypted = true)
-} catch (e: Throwable) {
-    log.w(
-        "EncryptedSharedPreferences unavailable, falling back to plaintext preferences; the " +
-            "pre-shared key and password will NOT be encrypted at rest",
-        e,
-    )
-    OpenedPreferences(
-        context.getSharedPreferences(PLAIN_FILE, Context.MODE_PRIVATE),
-        encrypted = false,
-    )
+private fun open(context: Context, log: Log): OpenedPreferences {
+    log.d { "opening the keystore-backed preference store" }
+    return OpenedPreferences(openEncryptedPreferences(context, ENCRYPTED_FILE))
 }
 
 private const val ENCRYPTED_FILE = "vpn-profile-encrypted"
 
-/** The file the old code fell back to; still read once, so a keystore that healed loses nothing. */
+/**
+ * The file older builds fell back to when the keystore was unavailable. It is still read once and
+ * then deleted: those installs have credentials sitting in the clear, and moving them into the
+ * encrypted store and erasing the source is strictly better than leaving them there.
+ */
 private const val PLAIN_FILE = "vpn-profile"

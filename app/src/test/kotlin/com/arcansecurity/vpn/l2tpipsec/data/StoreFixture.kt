@@ -19,8 +19,9 @@ import kotlinx.coroutines.runBlocking
  */
 internal class StoreFixture(
     val prefs: FakePreferences = FakePreferences(),
-    encrypted: Boolean = true,
     private val legacy: SharedPreferences? = null,
+    /** Simulates a device whose keystore will not open the store at all. */
+    private val openFails: Boolean = false,
 ) {
 
     val logged = mutableListOf<String>()
@@ -34,7 +35,8 @@ internal class StoreFixture(
     private val scope = CoroutineScope(Dispatchers.Unconfined)
 
     private val lazyPrefs = LazyPreferences(Dispatchers.Unconfined, log) {
-        OpenedPreferences(prefs, encrypted)
+        if (openFails) throw IllegalStateException("keystore unavailable")
+        OpenedPreferences(prefs)
     }
 
     /** The concrete vault; hand out [secrets] or [reader] to say which half is being used. */

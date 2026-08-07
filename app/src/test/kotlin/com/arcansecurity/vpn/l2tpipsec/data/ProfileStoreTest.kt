@@ -32,15 +32,17 @@ class ProfileStoreTest {
         assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
         assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
         assertNull(fixture.store.activeProfileId.value)
-        assertTrue(fixture.store.usesEncryptedStorage.value)
     }
 
     @Test
-    fun `the plaintext fallback is reported so the UI can warn about it`() {
-        val fixture = StoreFixture(encrypted = false)
+    fun `no credential store at all is terminal, not a degraded mode`() {
+        // There is deliberately no plaintext fallback: the app would rather not run than keep a
+        // pre-shared key outside the keystore.
+        val fixture = StoreFixture(openFails = true)
 
-        assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
-        assertFalse(fixture.store.usesEncryptedStorage.value)
+        assertEquals(ProfileStoreState.UNREADABLE, fixture.awaitLoaded())
+        assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
+        assertNull(fixture.store.activeProfileId.value)
     }
 
     // ------------------------------------------------------------------ multiple profiles

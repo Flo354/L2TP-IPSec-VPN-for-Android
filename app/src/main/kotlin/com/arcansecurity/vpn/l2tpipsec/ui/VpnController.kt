@@ -75,7 +75,6 @@ class VpnController private constructor(private val appContext: Context) {
     private val _storeState = MutableStateFlow(ProfileStoreState.LOADING)
     private val _profiles = MutableStateFlow<List<VpnProfile>>(emptyList())
     private val _activeProfileId = MutableStateFlow<String?>(null)
-    private val _usesEncryptedStorage = MutableStateFlow(true)
     private val _backStack = MutableStateFlow<List<Route>>(listOf(Route.Home))
     private val _editor = MutableStateFlow<EditorState?>(null)
     private val _message = MutableStateFlow<String?>(null)
@@ -88,8 +87,6 @@ class VpnController private constructor(private val appContext: Context) {
 
     val activeProfileId: StateFlow<String?> get() = _activeProfileId.asStateFlow()
 
-    /** `false` when the keystore refused to encrypt the store; the UI warns about it. */
-    val usesEncryptedStorage: StateFlow<Boolean> get() = _usesEncryptedStorage.asStateFlow()
 
     val backStack: StateFlow<List<Route>> get() = _backStack.asStateFlow()
 
@@ -110,7 +107,6 @@ class VpnController private constructor(private val appContext: Context) {
             launch { components.profiles.profiles.collect { _profiles.value = it } }
             launch { components.profiles.activeProfileId.collect { _activeProfileId.value = it } }
             launch {
-                components.profiles.usesEncryptedStorage.collect { _usesEncryptedStorage.value = it }
             }
         }
     }
