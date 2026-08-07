@@ -71,10 +71,10 @@ router (`testserver/`):
 
 | Check | Result |
 | --- | --- |
-| `:core` unit tests | 282 pass |
+| `:core` unit tests | 283 pass (277 hermetic, 6 need the lab server) |
 | `:app` unit tests | 30 pass |
 | End-to-end against the live server | 4 pass — tunnel established, ICMP echo round-trips through the full stack |
-| Rekeying against the live server | 1 pass — both SAs replaced, traffic never stops |
+| Rekeying against the live server | both directions pass — SAs replaced by us and by the server, traffic never stops |
 | PPP authentication | PAP, CHAP-MD5 and MS-CHAPv2 all negotiate and authenticate |
 | Wrong PSK / wrong password | fail fast with the correct, distinguishable error |
 | `:app:lintDebug` | no errors |
@@ -118,6 +118,15 @@ That test watches both SAs get replaced and then pings again *after* the superse
 deleted, which is the case that would break if the server treated the IPsec SAs as children of the
 ISAKMP SA they were negotiated under.
 
+The other direction — the router deciding to rekey and the client having to answer — needs a lab
+that rekeys on its own schedule:
+
+```bash
+ESP_LIFETIME=2m IKE_LIFETIME=30m REKEY=yes MARGINTIME=60s testserver/run.sh
+./gradlew :core:test -Dl2tp.test.server=172.28.0.10 -Dl2tp.test.rekey.responder=true \
+    --tests '*LiveRekeyTest'
+```
+
 ## Rekeying
 
 Every IPsec and ISAKMP SA carries a lifetime, and when it runs out the peer stops accepting the
@@ -139,6 +148,11 @@ keys. The client replaces both before that happens:
   routine housekeeping after a rekey; only the second is a reason to act.
 * Also triggers on ESP sequence-number exhaustion, and renegotiates phase 1 immediately if the peer
   drops the ISAKMP SA.
+
+Not covered: a peer that renegotiates **phase 1** by starting a Main Mode of its own. That message
+arrives under cookies we know nothing about and is dropped, and the tunnel falls back to
+reconnecting. Rekeying phase 1 well before the peer's own deadline is what keeps this from
+happening in practice.
 
 All of this runs on a maintenance thread that owns the ISAKMP queue, so a rekey — which blocks on
 the peer for a few round trips — never stalls the packet pump.
