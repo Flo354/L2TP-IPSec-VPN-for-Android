@@ -130,6 +130,70 @@ class LiveRekeyTest {
         }
     }
 
+    /**
+     * The other half of rekeying: the router decides to replace the SA and we have to answer its
+     * Quick Mode. Needs a lab that rekeys on its own:
+     * ```
+     * ESP_LIFETIME=2m REKEY=yes MARGINTIME=60s testserver/run.sh
+     * ./gradlew :core:test -Dl2tp.test.server=172.28.0.10 -Dl2tp.test.rekey.responder=true \
+     *     --tests '*LiveRekeyTest'
+     * ```
+     */
+    @Test
+    fun `a rekey started by the server is answered and traffic keeps flowing`() {
+        assumeTrue("set -Dl2tp.test.server to run the live tests", server != null)
+        assumeTrue(
+            "start the lab with ESP_LIFETIME=2m REKEY=yes MARGINTIME=60s and set " +
+                "-Dl2tp.test.rekey.responder=true",
+            System.getProperty("l2tp.test.rekey.responder").toBoolean(),
+        )
+
+        val recorder = Recorder()
+        val provider = FakeTunProvider()
+        val tunnel = L2tpIpsecTunnel(
+            // Default lifetimes on our side, so our own rekey timer is three quarters of an hour
+            // away: anything that happens in the next two minutes can only have come from the peer.
+            config = VpnConfig(
+                serverHost = server!!,
+                presharedKey = System.getProperty("l2tp.test.psk", "TestPreSharedKey2024!"),
+                username = System.getProperty("l2tp.test.user", "vpnuser"),
+                password = System.getProperty("l2tp.test.password", "VpnPass123"),
+                connectTimeoutMs = 30_000,
+            ),
+            socketFactory = TestUdpSocketFactory(InetAddress.getByName(server)),
+            tunProvider = provider,
+            listener = recorder,
+            logger = VpnLogger.STDOUT,
+        )
+        Thread({ tunnel.run() }, "e2e-rekey-responder").apply { isDaemon = true }.start()
+
+        try {
+            assertTrue(
+                "tunnel did not connect: ${recorder.errorKind} ${recorder.errorMessage}",
+                recorder.connected.await(60, TimeUnit.SECONDS),
+            )
+            val info = recorder.info!!
+            val tun = provider.established!!
+            assertTrue(ping(tun, info, sequence = 1))
+
+            val deadline = System.currentTimeMillis() + 150_000
+            while (System.currentTimeMillis() < deadline && tunnel.stats.ipsecRekeys < 1) {
+                assertNull("the tunnel died instead of rekeying: ${recorder.errorMessage}", recorder.errorKind)
+                Thread.sleep(1_000)
+            }
+            assertTrue(
+                "the server never rekeyed, or we failed to answer it (stats=${tunnel.stats})",
+                tunnel.stats.ipsecRekeys >= 1,
+            )
+            println("peer-initiated rekeys observed: ${tunnel.stats.ipsecRekeys}")
+            assertTrue("traffic stopped after the peer's rekey", ping(tun, info, sequence = 2))
+            assertNull("the tunnel reported a failure: ${recorder.errorMessage}", recorder.errorKind)
+        } finally {
+            tunnel.stop()
+            recorder.finished.await(15, TimeUnit.SECONDS)
+        }
+    }
+
     /** One ICMP echo through the whole stack; true when the reply comes back. */
     private fun ping(tun: FakeTun, info: TunnelInfo, sequence: Int): Boolean {
         val payload = "rekey-probe".toByteArray()

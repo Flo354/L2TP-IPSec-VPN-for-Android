@@ -32,7 +32,8 @@ tasks.withType<Test>().configureEach {
     systemProperty("java.net.preferIPv4Stack", "true")
     // Forward the live-server switches so `LiveServerE2eTest` can opt in; without them it skips.
     for (key in listOf(
-        "l2tp.test.server", "l2tp.test.psk", "l2tp.test.user", "l2tp.test.password", "l2tp.test.rekey",
+        "l2tp.test.server", "l2tp.test.psk", "l2tp.test.user", "l2tp.test.password",
+        "l2tp.test.rekey", "l2tp.test.rekey.responder",
     )) {
         System.getProperty(key)?.let { systemProperty(key, it) }
     }
