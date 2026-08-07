@@ -9,6 +9,27 @@ offers L2TP/IPsec PSK and nothing else.
 Every layer of the stack — ISAKMP/IKEv1, ESP, L2TPv2, PPP — is implemented in Kotlin inside the app
 process, on top of one ordinary UDP socket.
 
+> ### Provenance: this was written entirely by an AI
+>
+> **100 % of this repository was written by Claude** (Anthropic's model) — the protocol stack, the
+> Android app, every test, the Docker lab and all of this documentation. It was produced in one
+> extended session from a prompt describing the problem, written against the RFCs rather than ported
+> from an existing L2TP/IPsec implementation. No line was hand-written afterwards.
+>
+> The human set the goal and the constraints, supplied the hardware, ran the app on a real Galaxy
+> S25+ against a real Orange Livebox Pro, pasted the logcat back, and made the product calls — such
+> as removing the plaintext credential fallback. That loop is what found three defects no test had
+> caught: a reconnect loop that tore the tunnel down 27 ms after it came up, a teardown that never
+> reached the router, and an MTU that ignored the peer's advertised MRU.
+>
+> **What that means if you are considering using it.** It has been verified by execution, not merely
+> generated: it establishes a real tunnel against a real router and against a strongSwan lab, and the
+> tests pin the RFC vectors. But **no human expert has reviewed the IKEv1 or ESP code**, and the
+> credential-storage path has never run on a device — see
+> [docs/security.md](docs/security.md#what-is-not-claimed). This is a VPN client that handles a
+> pre-shared key and a password. Read it before you trust it with yours, and judge it on the code and
+> the tests rather than on where it came from.
+
 ## The layering
 
 ```
