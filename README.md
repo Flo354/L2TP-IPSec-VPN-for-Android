@@ -92,6 +92,33 @@ Requires the Android SDK (`compileSdk 37`, `minSdk 26`) and a JDK the Gradle wra
 Kotlin Android plugin is deliberately absent from `:app` — AGP supplies Kotlin for Android modules
 itself.
 
+### A signed release build
+
+`./gradlew :app:assembleRelease` works out of the box and produces an **unsigned** APK, which
+Android will not install. To get an installable one, generate a key and point the build at it. The
+keystore belongs outside this repository; `keystore.properties`, `*.jks` and friends are gitignored
+as a safety net, not as the plan.
+
+```bash
+mkdir -p ~/keystores
+keytool -genkeypair -v \
+    -keystore ~/keystores/l2tpvpn-release.jks \
+    -storetype PKCS12 -alias l2tpvpn \
+    -keyalg RSA -keysize 4096 -validity 10000
+
+cp keystore.properties.example keystore.properties   # then fill it in
+./gradlew :app:assembleRelease
+```
+
+`keytool` asks for the password interactively, so it never reaches a shell history or a build file.
+With PKCS12 the key password must equal the store password. Verify the result with
+`apksigner verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk`; it should
+report v2 and v3 signatures.
+
+**Keep the key.** Android refuses an update signed by a different one, so losing it means uninstall
+and reinstall — which wipes the saved profiles and their credentials. Leaking it means anyone can
+sign an update that installs cleanly over yours.
+
 On the device: create a profile — server address, pre-shared key, user name and password — and press
 Connect. Several profiles can be saved, with one marked active; they can be edited, duplicated and
 deleted. The advanced section exposes the phase 1 / phase 2 proposals, exchange mode, local identity,

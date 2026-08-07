@@ -21,5 +21,14 @@ captures/
 # Local SDK location
 local.properties
 
+# Release signing. The keystore itself should live outside the repository entirely; these patterns
+# are the safety net, not the plan. Losing this key means never being able to update an installed
+# build; leaking it means anyone can sign an update as you.
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+
 # Lab packet captures
 testserver/captures/
