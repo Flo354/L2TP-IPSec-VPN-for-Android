@@ -22,16 +22,22 @@ import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelInfo
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelListener
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelState
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelStats
+import com.arcansecurity.vpn.l2tpipsec.core.tunnel.VpnConfig
 import com.arcansecurity.vpn.l2tpipsec.core.util.Log
 import com.arcansecurity.vpn.l2tpipsec.core.util.LogLevel
-import com.arcansecurity.vpn.l2tpipsec.data.ProfileRepository
+import com.arcansecurity.vpn.l2tpipsec.data.ProfileStoreState
+import com.arcansecurity.vpn.l2tpipsec.data.SecretKind
 import com.arcansecurity.vpn.l2tpipsec.data.VpnProfile
-import com.arcansecurity.vpn.l2tpipsec.data.validate
 import com.arcansecurity.vpn.l2tpipsec.label
 import com.arcansecurity.vpn.l2tpipsec.platform.AndroidLogger
 import com.arcansecurity.vpn.l2tpipsec.platform.AndroidTunProvider
 import com.arcansecurity.vpn.l2tpipsec.platform.AndroidUdpSocketFactory
+import com.arcansecurity.vpn.l2tpipsec.platform.AppComponentsHolder
 import com.arcansecurity.vpn.l2tpipsec.ui.MainActivity
+import com.arcansecurity.vpn.l2tpipsec.ui.profile.wipe
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
@@ -79,7 +85,14 @@ class L2tpVpnService : VpnService() {
      */
     private val tunDescriptor = AtomicReference<ParcelFileDescriptor?>(null)
 
-    @Volatile private var profile: VpnProfile = VpnProfile()
+    /**
+     * Only what the notification needs, copied out of the profile once it is loaded. The profile
+     * itself is not kept: the tunnel runs off the [VpnConfig] the worker assembled, so a profile
+     * edited mid-connection cannot half-apply itself to a live tunnel.
+     */
+    @Volatile private var profileName: String = ""
+    @Volatile private var serverHost: String = ""
+
     @Volatile private var stopRequested = false
     @Volatile private var networkChangePending = false
 
@@ -158,6 +171,15 @@ class L2tpVpnService : VpnService() {
 
     // ---------------------------------------------------------------- lifecycle
 
+    /**
+     * Starts the worker and returns immediately.
+     *
+     * Nothing is read here. Loading the active profile means opening a keystore-backed store, and
+     * reading its secrets means a second round of keystore work; both used to happen on this line,
+     * which is the main looper — `onStartCommand` runs there, and the system is timing us against
+     * the five seconds it allows before it kills a foreground service that has not called
+     * `startForeground`. [loadConfiguration] now does it on the worker instead.
+     */
     private fun startTunnel() {
         if (!running.compareAndSet(false, true)) {
             if (stopRequested) {
@@ -168,32 +190,87 @@ class L2tpVpnService : VpnService() {
             return
         }
 
-        val loaded = ProfileRepository.get(this, logger).profile.value
-        val validation = loaded.validate()
-        if (!validation.isValid) {
-            val message = validation.errors.joinToString("; ") { it.message }
-            log.e("Refusing to connect, the profile is invalid: $message")
-            VpnStatusRepository.onFailure(TunnelErrorKind.INTERNAL, message)
-            shutdown()
-            running.set(false)
-            return
-        }
-
-        profile = loaded
-        logger.minLevel = if (loaded.debugLogging) LogLevel.DEBUG else LogLevel.INFO
         stopRequested = false
         networkChangePending = false
         reconnectPolicy.reset()
 
         VpnStatusRepository.onStarting()
         pushNotification()
-        registerNetworkCallback()
 
-        log.i("Connecting to ${loaded.server} (${loaded.name})")
         worker = Thread({ runTunnelLoop() }, WORKER_NAME).apply {
             isDaemon = true
             start()
         }
+    }
+
+    /**
+     * Reads the active profile and its secrets. **Worker thread only.**
+     *
+     * The secrets are handed over as `CharArray`s and wiped as soon as [prepareConnect] has built
+     * the configuration. That is only a partial win — `VpnConfig` takes `String`s, so the values do
+     * end up in immortal objects for as long as the tunnel lives — but it keeps them out of the
+     * vault's own buffers and out of anything that survives a failed attempt.
+     */
+    private fun loadConfiguration(): VpnConfig? {
+        VpnStatusRepository.onState(TunnelState.RESOLVING, "Loading the profile")
+        pushNotification()
+
+        val components = try {
+            AppComponentsHolder.getBlocking(this)
+        } catch (e: Throwable) {
+            reject("The profile store could not be opened: ${e.message ?: e.javaClass.simpleName}")
+            return null
+        }
+
+        val store = components.profiles
+        // Always-on VPN can start us before anything has read the store, so wait for it — but not
+        // forever: a store that never leaves LOADING must fail visibly rather than hang the service.
+        val ready = runBlocking {
+            withTimeoutOrNull(STORE_READY_TIMEOUT_MS) {
+                store.state.first { it != ProfileStoreState.LOADING }
+            }
+        }
+        if (ready == null) {
+            reject("The profile store did not finish loading")
+            return null
+        }
+
+        val activeId = store.activeProfileId.value
+        val profile = store.profiles.value.firstOrNull { it.id == activeId }
+        var presharedKey: CharArray? = null
+        var password: CharArray? = null
+        return try {
+            if (profile != null) {
+                presharedKey = components.secrets.read(profile.id, SecretKind.PRESHARED_KEY)
+                password = components.secrets.read(profile.id, SecretKind.PASSWORD)
+            }
+            when (val prepared = prepareConnect(profile, presharedKey, password)) {
+                is ConnectPreparation.Rejected -> {
+                    reject(prepared.reason)
+                    null
+                }
+
+                is ConnectPreparation.Ready -> {
+                    profileName = profile?.name.orEmpty()
+                    serverHost = prepared.config.serverHost
+                    logger.minLevel =
+                        if (prepared.config.debugLogging) LogLevel.DEBUG else LogLevel.INFO
+                    log.i("Connecting to $serverHost ($profileName)")
+                    prepared.config
+                }
+            }
+        } finally {
+            presharedKey.wipe()
+            password.wipe()
+        }
+    }
+
+    /** Reports a configuration problem the user has to fix; never retried. */
+    private fun reject(reason: String) {
+        log.e("Refusing to connect: $reason")
+        VpnStatusRepository.onFailure(TunnelErrorKind.INTERNAL, reason)
+        VpnStatusRepository.onState(TunnelState.FAILED, reason)
+        pushNotification()
     }
 
     private fun stopTunnel(state: TunnelState) {
@@ -240,9 +317,15 @@ class L2tpVpnService : VpnService() {
 
     private fun runTunnelLoop() {
         try {
+            // First thing on the worker: everything that touches storage. A rejection here is a
+            // configuration problem, so it stops rather than entering the retry loop.
+            val config = loadConfiguration() ?: return
+            if (stopRequested) return
+            registerNetworkCallback()
+
             while (!stopRequested) {
                 networkChangePending = false
-                val attempt = runOnce()
+                val attempt = runOnce(config)
                 if (stopRequested) break
 
                 val failure = when (attempt) {
@@ -302,17 +385,7 @@ class L2tpVpnService : VpnService() {
         }
     }
 
-    private fun runOnce(): Attempt {
-        val config = try {
-            profile.toVpnConfig()
-        } catch (e: IllegalArgumentException) {
-            return Attempt.Failed(
-                TunnelErrorKind.INTERNAL,
-                e.message ?: "Invalid configuration",
-                retryable = false,
-            )
-        }
-
+    private fun runOnce(config: VpnConfig): Attempt {
         VpnStatusRepository.onState(TunnelState.RESOLVING, "Resolving ${config.serverHost}")
         pushNotification()
 
@@ -334,7 +407,7 @@ class L2tpVpnService : VpnService() {
                 // Anything still held here belongs to an attempt that is already over.
                 tunDescriptor.getAndSet(descriptor)?.let { stale -> runCatching { stale.close() } }
             },
-            sessionName = profile.name.ifBlank { VpnProfile.DEFAULT_NAME },
+            sessionName = profileName.ifBlank { VpnProfile.DEFAULT_NAME },
             configureIntent = configureIntent(),
             logger = logger,
         )
@@ -548,7 +621,7 @@ class L2tpVpnService : VpnService() {
             state = VpnStatusRepository.state.value,
             detail = VpnStatusRepository.detail.value,
             info = VpnStatusRepository.info.value,
-            serverHost = profile.server,
+            serverHost = serverHost,
         )
         synchronized(foregroundLock) {
             when (foregroundState) {
@@ -640,6 +713,13 @@ class L2tpVpnService : VpnService() {
          * longer than the tunnel's own grace period, since this is only the backstop.
          */
         private const val SOCKET_CLOSE_GRACE_MS = 3_000L
+
+        /**
+         * How long the worker waits for the store to leave `LOADING`. Generous, because always-on
+         * VPN can start the service during boot while the keystore is still warming up, but finite,
+         * because a store that never becomes readable has to surface as a failure.
+         */
+        private const val STORE_READY_TIMEOUT_MS = 15_000L
 
         const val ACTION_CONNECT = "com.arcansecurity.vpn.l2tpipsec.action.CONNECT"
         const val ACTION_DISCONNECT = "com.arcansecurity.vpn.l2tpipsec.action.DISCONNECT"

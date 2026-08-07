@@ -181,12 +181,19 @@ data class L2tpAvp(
         return result
     }
 
+    /**
+     * Names the attribute and its size but never its bytes. An AVP body is not automatically
+     * harmless: a Challenge Response is authentication material, and once tunnel authentication is
+     * wired up a parsed hidden AVP carries its recovered cleartext here. Logs are shareable, so the
+     * value stays out of them by construction rather than by remembering not to log it.
+     */
     override fun toString(): String = buildString {
         append(describeType())
         if (mandatory) append("(M)")
         if (hidden) append("(H)")
-        append('=')
-        append(Bytes.toHex(value))
+        append('[')
+        append(value.size)
+        append(" bytes]")
     }
 
     companion object {

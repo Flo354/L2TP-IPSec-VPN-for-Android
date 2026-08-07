@@ -45,7 +45,7 @@ data class PppOption(val type: Int, val value: ByteArray) {
 
     override fun hashCode(): Int = 31 * type + value.contentHashCode()
 
-    override fun toString(): String = "PppOption(type=$type, value=${Bytes.toHex(value)})"
+    override fun toString(): String = "PppOption(type=$type, ${value.size} bytes)"
 }
 
 /** Code / identifier / options triple shared by LCP and IPCP. */
@@ -81,8 +81,14 @@ data class PppControlPacket(val code: Int, val identifier: Int, val data: ByteAr
 
     override fun hashCode(): Int = 31 * (31 * code + identifier) + data.contentHashCode()
 
+    /**
+     * The body is summarised, never dumped. A PAP Authenticate-Request body *is* the cleartext
+     * password, and a CHAP response is authentication material; nothing logs one of these today,
+     * but a `$packet` in a future diagnostic would publish the credential to logcat and to the
+     * app's share-log action.
+     */
     override fun toString(): String =
-        "PppControlPacket(${PppCode.name(code)}, id=$identifier, data=${Bytes.toHex(data)})"
+        "PppControlPacket(${PppCode.name(code)}, id=$identifier, ${data.size} bytes)"
 
     companion object {
         /** Code, identifier and the 16-bit length field. */

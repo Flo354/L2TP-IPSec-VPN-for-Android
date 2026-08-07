@@ -12,6 +12,7 @@ import com.arcansecurity.vpn.l2tpipsec.core.util.ByteReader
 import com.arcansecurity.vpn.l2tpipsec.core.util.ByteWriter
 import com.arcansecurity.vpn.l2tpipsec.core.util.Bytes
 import java.net.InetAddress
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * The responder half of an IKEv1 exchange, good enough to drive [IkeV1Negotiator] end to end.
@@ -106,8 +107,22 @@ class FakeIkeResponder(
 
     var informationalsReceived = 0
         private set
-    val receivedNotifyTypes = mutableListOf<Int>()
-    val receivedDeleteProtocols = mutableListOf<Int>()
+
+    /**
+     * Every notify received on this SA, in order. Copy-on-write because a tunnel test polls it from
+     * the test thread while the client's own threads are still feeding this responder.
+     */
+    val receivedNotifies: MutableList<NotifyPayload> = CopyOnWriteArrayList()
+
+    val receivedNotifyTypes: List<Int> get() = receivedNotifies.map { it.notifyType }
+    val receivedDeleteProtocols: MutableList<Int> = CopyOnWriteArrayList()
+
+    /**
+     * Invoked the moment a Quick Mode has produced ESP keys, whichever side started it. It is the
+     * only reliable signal: the initiator's exchange ends on a message this responder answers with
+     * nothing, and its own ends on one it answers with HASH(3).
+     */
+    var onEspKeysDerived: (() -> Unit)? = null
 
     private lateinit var dh: DiffieHellman
     private lateinit var gxi: ByteArray
@@ -126,6 +141,21 @@ class FakeIkeResponder(
     private var quickModeSecret = ByteArray(0)
     private lateinit var quickModeNi: ByteArray
     private lateinit var quickModeNr: ByteArray
+
+    /**
+     * True once phase 1 has produced a key schedule, i.e. once there is an ISAKMP SA here worth
+     * keeping. A server that sees a second Main Mode start uses this to tell a rekey — which leaves
+     * two SAs live at once — from the very first exchange.
+     */
+    val hasEstablishedSa: Boolean get() = this::skeyid.isInitialized
+
+    /** True when [header] carries the initiator cookie of the SA this responder holds. */
+    fun matchesInitiator(header: IsakmpHeader): Boolean =
+        this::initiatorCookie.isInitialized && header.initiatorCookie.contentEquals(initiatorCookie)
+
+    /** True when [header] is addressed to this responder's ISAKMP SA. */
+    fun owns(header: IsakmpHeader): Boolean =
+        matchesInitiator(header) && header.responderCookie.contentEquals(responderCookie)
 
     /** Feeds one datagram to the responder and returns its reply, or null when none is due. */
     fun onMessage(raw: ByteArray): ByteArray? {
@@ -401,6 +431,7 @@ class FakeIkeResponder(
         inboundIntegrityKey = inbound.copyOfRange(encryptionKeyBytes, needed)
         outboundEncryptionKey = outbound.copyOfRange(0, encryptionKeyBytes)
         outboundIntegrityKey = outbound.copyOfRange(encryptionKeyBytes, needed)
+        onEspKeysDerived?.invoke()
     }
 
     private fun keymat(spi: Int, length: Int): ByteArray {
@@ -434,7 +465,7 @@ class FakeIkeResponder(
         } else {
             IsakmpCodec.decodeMessage(raw, header)
         }
-        chain.all<NotifyPayload>().forEach { receivedNotifyTypes += it.notifyType }
+        chain.all<NotifyPayload>().forEach { receivedNotifies += it }
         chain.all<DeletePayload>().forEach { receivedDeleteProtocols += it.protocolId }
         return null
     }

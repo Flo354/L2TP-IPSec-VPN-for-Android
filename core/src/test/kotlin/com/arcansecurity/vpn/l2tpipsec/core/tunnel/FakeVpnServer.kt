@@ -6,9 +6,9 @@ import com.arcansecurity.vpn.l2tpipsec.core.esp.EspException
 import com.arcansecurity.vpn.l2tpipsec.core.esp.EspInboundSa
 import com.arcansecurity.vpn.l2tpipsec.core.esp.EspOutboundSa
 import com.arcansecurity.vpn.l2tpipsec.core.esp.UdpEncapsulation
-import com.arcansecurity.vpn.l2tpipsec.core.ike.ExchangeType
 import com.arcansecurity.vpn.l2tpipsec.core.ike.FakeIkeResponder
 import com.arcansecurity.vpn.l2tpipsec.core.ike.IsakmpHeader
+import com.arcansecurity.vpn.l2tpipsec.core.ike.PayloadType
 import com.arcansecurity.vpn.l2tpipsec.core.l2tp.L2tpAvp
 import com.arcansecurity.vpn.l2tpipsec.core.l2tp.L2tpAvpType
 import com.arcansecurity.vpn.l2tpipsec.core.l2tp.L2tpCodec
@@ -41,7 +41,7 @@ import com.arcansecurity.vpn.l2tpipsec.core.ppp.FakeLns as PppPeer
  * no more thread-safe than the client's.
  */
 class FakeVpnServer(
-    presharedKey: String,
+    private val presharedKey: String,
     private val clientAddress: InetAddress = InetAddress.getByName("192.168.1.5"),
     private val serverAddress: InetAddress = InetAddress.getByName("203.0.113.7"),
     /** Answers the client's PPP negotiation; the defaults mirror the strongSwan lab. */
@@ -53,7 +53,29 @@ class FakeVpnServer(
     override val localAddress: InetAddress get() = clientAddress
     override val localPort: Int = 34567
 
-    val responder = FakeIkeResponder(presharedKey, clientAddress, serverAddress, localPort)
+    /** The ISAKMP SA the client is talking on now. A phase-1 rekey replaces it with a fresh one. */
+    @Volatile
+    var responder = newResponder()
+        private set
+
+    /**
+     * The ISAKMP SA a phase-1 rekey superseded, kept live exactly as a real router keeps it until
+     * it sends its own Delete. One [FakeIkeResponder] cannot stand in for both: the second Main
+     * Mode overwrites the cookies and the whole key schedule of the first, so a server built on a
+     * single responder simply cannot be talked to on the SA that is being replaced — which is the
+     * one every message that matters during a rekey belongs to.
+     */
+    @Volatile
+    var supersededResponder: FakeIkeResponder? = null
+        private set
+
+    /**
+     * Datagrams to deliver on the SA being replaced the instant the client starts renegotiating
+     * phase 1. They are queued ahead of the Main Mode answer, which puts them inside the rekey
+     * window by construction rather than by sleeping and hoping.
+     */
+    @Volatile
+    var duringPhase1Rekey: ((FakeIkeResponder) -> List<ByteArray>)? = null
 
     /** ESP packets the client sent that this server could not authenticate. */
     val espFailures = AtomicInteger()
@@ -92,7 +114,6 @@ class FakeVpnServer(
     // i.e. the one the client sends on.
     private var espIn: EspInboundSa? = null
     private var espOut: EspOutboundSa? = null
-    private var installedInboundSpi = 0
 
     // LNS state.
     private val serverTunnelId = 0x4321
@@ -170,30 +191,62 @@ class FakeVpnServer(
 
     private fun onIsakmp(message: ByteArray, encapsulated: Boolean) {
         val header = IsakmpHeader.decode(message)
-        val reply = responder.onMessage(message)
-        // The responder derives the ESP keys on the last quick mode message, which is also the
-        // only one it has nothing to answer.
-        if (header.exchangeType == ExchangeType.QUICK_MODE && reply == null) installEsp()
-        if (reply == null) return
+        // The cookies decide which SA a message belongs to, exactly as they do on the client: for
+        // the length of a rekey the two SAs are both live and both being written to.
+        val target = supersededResponder?.takeIf { it.owns(header) } ?: currentResponder(header, encapsulated)
+        val reply = target.onMessage(message) ?: return
         inbox.put(if (encapsulated) UdpEncapsulation.NON_ESP_MARKER + reply else reply)
     }
 
-    private fun installEsp() {
-        if (responder.inboundSpi == installedInboundSpi) return
-        installedInboundSpi = responder.inboundSpi
+    /**
+     * The responder that owns the SA [header] belongs to, rotating a fresh one in when the client
+     * starts a second Main Mode and handing the SA it is replacing to [duringPhase1Rekey].
+     */
+    private fun currentResponder(header: IsakmpHeader, encapsulated: Boolean): FakeIkeResponder {
+        if (!startsNewPhase1(header)) return responder
+        val superseded = responder
+        supersededResponder = superseded
+        responder = newResponder()
+        duringPhase1Rekey?.invoke(superseded)?.forEach {
+            inbox.put(if (encapsulated) UdpEncapsulation.NON_ESP_MARKER + it else it)
+        }
+        return responder
+    }
+
+    /**
+     * A first phase-1 message carrying cookies we have never keyed. The initiator cookie is what
+     * rules out a retransmission of the rekey's own message 1, which would otherwise throw away the
+     * half-built SA every time the client repeated itself.
+     */
+    private fun startsNewPhase1(header: IsakmpHeader): Boolean =
+        responder.hasEstablishedSa && !responder.matchesInitiator(header) &&
+            !header.isEncrypted && header.nextPayload == PayloadType.SA
+
+    private fun newResponder(): FakeIkeResponder =
+        FakeIkeResponder(presharedKey, clientAddress, serverAddress, localPort).also { fresh ->
+            fresh.onEspKeysDerived = { installEsp(fresh) }
+        }
+
+    /**
+     * Switches both ESP directions to the pair [from] has just derived. It is driven by the
+     * responder rather than by "the quick mode had nothing to answer", because a Quick Mode this
+     * server started ends on a message it *does* answer, and an SA negotiated over the superseded
+     * ISAKMP SA is keyed by that responder rather than by the current one.
+     */
+    private fun installEsp(from: FakeIkeResponder) {
         espIn = EspInboundSa(
-            spi = responder.inboundSpi,
+            spi = from.inboundSpi,
             encryption = espEncryption,
             integrity = espIntegrity,
-            encryptionKey = responder.inboundEncryptionKey,
-            integrityKey = responder.inboundIntegrityKey,
+            encryptionKey = from.inboundEncryptionKey,
+            integrityKey = from.inboundIntegrityKey,
         )
         espOut = EspOutboundSa(
-            spi = responder.outboundSpi,
+            spi = from.outboundSpi,
             encryption = espEncryption,
             integrity = espIntegrity,
-            encryptionKey = responder.outboundEncryptionKey,
-            integrityKey = responder.outboundIntegrityKey,
+            encryptionKey = from.outboundEncryptionKey,
+            integrityKey = from.outboundIntegrityKey,
         )
     }
 

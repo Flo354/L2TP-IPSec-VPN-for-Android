@@ -23,7 +23,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.DhGroup
@@ -34,80 +33,70 @@ import com.arcansecurity.vpn.l2tpipsec.core.crypto.IkeHash
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.IkeExchangeMode
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.IkeIdentityType
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.PppAuthProtocol
-import com.arcansecurity.vpn.l2tpipsec.data.ProfileField
 import com.arcansecurity.vpn.l2tpipsec.data.VpnProfile
 import com.arcansecurity.vpn.l2tpipsec.label
+import com.arcansecurity.vpn.l2tpipsec.ui.profile.ProfileField
+import com.arcansecurity.vpn.l2tpipsec.ui.profile.ProfileFormState
 
-/** The always-visible half of the form: what you need to type to reach a router. */
+/**
+ * The always-visible half of the form: what you need to type to reach a router.
+ *
+ * The two secret fields arrive as slots rather than parameters. That is not decoration: it keeps
+ * the characters the user is typing inside the single composable that owns them
+ * (`ProfileEditScreen`) instead of threading them through every layer of the form, and it makes it
+ * obvious by inspection that this file never sees a secret at all.
+ */
 @Composable
-fun ProfileForm(
-    profile: VpnProfile,
-    enabled: Boolean,
+fun ConnectionSection(
+    form: ProfileFormState,
     errorFor: (ProfileField) -> String?,
-    onChange: (ProfileField, (VpnProfile) -> VpnProfile) -> Unit,
+    onChange: (ProfileField?, (VpnProfile) -> VpnProfile) -> Unit,
+    presharedKeyField: @Composable () -> Unit,
+    passwordField: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     SectionCard(title = "Connection", modifier = modifier) {
         VpnTextField(
             label = "Profile name",
-            value = profile.name,
+            value = form.profile.name,
             onValueChange = { value -> onChange(ProfileField.NAME) { it.copy(name = value) } },
             error = errorFor(ProfileField.NAME),
         )
         Spacer(Modifier.height(12.dp))
         VpnTextField(
             label = "Server",
-            value = profile.server,
+            value = form.profile.server,
             onValueChange = { value -> onChange(ProfileField.SERVER) { it.copy(server = value) } },
             error = errorFor(ProfileField.SERVER),
             placeholder = "vpn.example.com",
             keyboardType = KeyboardType.Uri,
         )
         Spacer(Modifier.height(12.dp))
-        SecretTextField(
-            label = "Pre-shared key",
-            value = profile.presharedKey,
-            onValueChange = { value ->
-                onChange(ProfileField.PRESHARED_KEY) { it.copy(presharedKey = value) }
-            },
-            error = errorFor(ProfileField.PRESHARED_KEY),
-        )
+        presharedKeyField()
         Spacer(Modifier.height(12.dp))
         VpnTextField(
             label = "User name",
-            value = profile.username,
+            value = form.profile.username,
             onValueChange = { value -> onChange(ProfileField.USERNAME) { it.copy(username = value) } },
             error = errorFor(ProfileField.USERNAME),
         )
         Spacer(Modifier.height(12.dp))
-        SecretTextField(
-            label = "Password",
-            value = profile.password,
-            onValueChange = { value -> onChange(ProfileField.PASSWORD) { it.copy(password = value) } },
-            error = errorFor(ProfileField.PASSWORD),
-            imeAction = ImeAction.Done,
-        )
-        if (!enabled) {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "Disconnect to change the profile.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+        passwordField()
     }
 }
 
 /** Everything a normal user should never have to open. */
 @Composable
 fun AdvancedSection(
-    profile: VpnProfile,
+    form: ProfileFormState,
     expanded: Boolean,
     onToggle: () -> Unit,
     errorFor: (ProfileField) -> String?,
     onChange: (ProfileField?, (VpnProfile) -> VpnProfile) -> Unit,
+    onMtuChange: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val profile = form.profile
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -125,7 +114,7 @@ fun AdvancedSection(
                 Text("Advanced", style = MaterialTheme.typography.titleMedium)
                 Text(
                     text = "${profile.phase1Encryption.label}-${profile.phase1Hash.label}-" +
-                        "${profile.phase1DhGroup.label.substringBefore(' ')} · MTU ${profile.mtu}",
+                        "${profile.phase1DhGroup.label.substringBefore(' ')} · MTU ${form.mtuText}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -248,12 +237,8 @@ fun AdvancedSection(
                 SubHeading("Network")
                 VpnTextField(
                     label = "MTU",
-                    value = profile.mtu.toString(),
-                    onValueChange = { value ->
-                        onChange(ProfileField.MTU) {
-                            it.copy(mtu = value.filter(Char::isDigit).take(4).toIntOrNull() ?: 0)
-                        }
-                    },
+                    value = form.mtuText,
+                    onValueChange = onMtuChange,
                     error = errorFor(ProfileField.MTU),
                     supporting = "1400 leaves room for the ESP and L2TP headers",
                     keyboardType = KeyboardType.Number,

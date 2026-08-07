@@ -29,6 +29,21 @@ interface IkeTransport {
 
     /** Next raw ISAKMP message (marker already stripped), or null on timeout. */
     fun receiveIsakmp(timeoutMs: Int): ByteArray?
+
+    /**
+     * Hands back a datagram addressed to an ISAKMP SA this negotiator does not own.
+     *
+     * A phase-1 rekey builds a second negotiator that reads the very same inbound stream while the
+     * SA being replaced is still live, so everything the peer sends on that older SA — a DPD
+     * R-U-THERE, a Delete, a Quick Mode it started — arrives at a negotiator holding none of the
+     * keys it was encrypted under. Dropping it is what makes a peer conclude the tunnel is dead, so
+     * it is parked here for whoever does own that SA.
+     *
+     * Implementations must never hand the message back through [receiveIsakmp]: the negotiator
+     * would read it, fail to own it again, and spin. They must also bound whatever they park it in,
+     * because a peer can keep sending for as long as the rekey lasts.
+     */
+    fun deferForeignMessage(message: ByteArray)
 }
 
 /**

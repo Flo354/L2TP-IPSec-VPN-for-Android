@@ -430,6 +430,8 @@ class IkeV1NegotiatorTest {
         }
 
         override fun receiveIsakmp(timeoutMs: Int): ByteArray? = inbox.removeFirstOrNull()
+
+        override fun deferForeignMessage(message: ByteArray) = Unit
     }
 
     private class SilentTransport : IkeTransport {
@@ -448,5 +450,7 @@ class IkeV1NegotiatorTest {
         }
 
         override fun receiveIsakmp(timeoutMs: Int): ByteArray? = null
+
+        override fun deferForeignMessage(message: ByteArray) = Unit
     }
 }

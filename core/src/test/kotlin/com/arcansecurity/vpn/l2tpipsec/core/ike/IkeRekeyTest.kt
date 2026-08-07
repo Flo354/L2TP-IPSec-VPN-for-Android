@@ -171,6 +171,61 @@ class IkeRekeyTest {
         assertNull(negotiator.respondToQuickMode(phase1, requests[5]))
     }
 
+    /**
+     * A phase-1 rekey leaves two ISAKMP SAs live at once, and the second negotiator is the only
+     * reader of the inbound stream while it runs. Everything the peer goes on sending on the SA
+     * being replaced therefore lands in a negotiator that holds none of its keys, and discarding it
+     * is what leaves a DPD probe unanswered for the whole window.
+     */
+    @Test
+    fun `a message for the superseded sa is handed back rather than dropped during a rekey`() {
+        val oldResponder = responder()
+        val oldNegotiator = IkeV1Negotiator(config(), transportFor(oldResponder))
+        val oldPhase1 = oldNegotiator.establishPhase1()
+        val probe = oldResponder.buildDpdRequest(0x2b)
+
+        val newResponder = responder()
+        val newTransport = transportFor(newResponder)
+        // Queued ahead of Main Mode message 2, so it arrives squarely inside the rekey window.
+        newTransport.deliverBeforeNextReply(probe)
+        val newPhase1 = IkeV1Negotiator(config(), newTransport).establishPhase1()
+
+        assertFalse(
+            "the two SAs must be distinct for this to prove anything",
+            oldPhase1.initiatorCookie.contentEquals(newPhase1.initiatorCookie),
+        )
+        assertArrayEquals(
+            "the probe for the old SA must come back rather than disappear",
+            probe,
+            newTransport.deferred.singleOrNull(),
+        )
+    }
+
+    /**
+     * The same overlap the other way round: a Quick Mode the peer started on the SA a rekey has
+     * just superseded is answered by *that* SA's negotiator, so a probe for the SA that replaced it
+     * would otherwise be checked against the wrong keys while we wait for HASH(3).
+     */
+    @Test
+    fun `a message for another sa is handed back while we wait for HASH(3)`() {
+        val responder = responder()
+        val transport = transportFor(responder)
+        val negotiator = IkeV1Negotiator(config(), transport)
+        val phase1 = negotiator.establishPhase1()
+
+        val otherResponder = responder()
+        IkeV1Negotiator(config(), transportFor(otherResponder)).establishPhase1()
+        val probe = otherResponder.buildDpdRequest(0x2c)
+
+        val request = responder.startQuickMode()
+        // Flushed when we send message 2, i.e. just before the HASH(3) that closes the exchange.
+        transport.deliverBeforeNextReply(probe)
+
+        assertNotNull("the exchange must still complete", negotiator.respondToQuickMode(phase1, request))
+        assertTrue("the peer must have accepted our HASH(2)", responder.quickModeHash1Verified)
+        assertArrayEquals(probe, transport.deferred.singleOrNull())
+    }
+
     @Test
     fun `an esp delete names the spi instead of tearing the whole tunnel down`() {
         val responder = responder()

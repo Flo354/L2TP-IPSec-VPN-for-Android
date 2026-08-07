@@ -86,6 +86,24 @@ class L2tpIpsecTunnel(
     private val ikeQueue = ArrayBlockingQueue<ByteArray>(32)
     private val l2tpQueue = ArrayBlockingQueue<ByteArray>(256)
 
+    /**
+     * ISAKMP messages a negotiator read off [ikeQueue] and could not own.
+     *
+     * A rekey runs a second negotiator on the maintenance thread, and that thread is the only
+     * consumer of [ikeQueue], so for the few round trips a Main Mode takes the new negotiator is
+     * the one draining it — and everything still arriving for the SA being replaced is addressed
+     * to cookies it does not have and encrypted under keys it cannot derive. Parking those here
+     * rather than dropping them is what keeps a DPD probe, a Delete or a peer-initiated Quick Mode
+     * alive across the window.
+     *
+     * It is deliberately *not* [ikeQueue]: putting a message back on the queue the negotiator is
+     * reading would have it read, reject and requeue the same datagram for ever. [drainIkeQueue]
+     * empties this first, and because it runs on the same thread as the rekey it cannot possibly
+     * run before the new context has been installed — which is what stops a deferred message from
+     * being attributed to the SA that was current when it arrived.
+     */
+    private val deferredIkeQueue = ArrayBlockingQueue<ByteArray>(16)
+
     // Reader-thread state. The overflow warning is rate-limited because the reader is the hot
     // path: one line per dropped datagram is how a log gets to a gigabyte in a minute.
     private var droppedDatagrams = 0L
@@ -681,9 +699,15 @@ class L2tpIpsecTunnel(
         thread.start()
     }
 
+    /**
+     * Dispatches every inbound ISAKMP message to the negotiator that owns its SA.
+     *
+     * Messages a rekey handed back come first: they arrived before anything still on [ikeQueue],
+     * and a Delete must not be applied out of order with the exchange that followed it.
+     */
     private fun drainIkeQueue() {
         while (!stopRequested.get()) {
-            val message = ikeQueue.poll() ?: return
+            val message = deferredIkeQueue.poll() ?: ikeQueue.poll() ?: return
             val header = try {
                 IsakmpHeader.decode(message)
             } catch (e: Exception) {
@@ -784,6 +808,12 @@ class L2tpIpsecTunnel(
      * Renegotiates the ISAKMP SA with a brand-new negotiator, because the cookies and the whole key
      * schedule belong to one SA and cannot be reused. The old context stays reachable for a moment
      * so a delete or a DPD ack that is already in flight still decrypts.
+     *
+     * This blocks the maintenance thread for the few round trips a Main Mode takes, and that thread
+     * is the only consumer of [ikeQueue], so the new negotiator drains the queue on its behalf for
+     * the whole window. Everything it reads and cannot own comes back through
+     * [IkeTransport.deferForeignMessage] into [deferredIkeQueue], which the loop below empties as
+     * soon as this returns — by which point [ike] and [previousIke] both name the SA they should.
      */
     private fun rekeyPhase1() {
         val old = ike ?: return
@@ -1015,6 +1045,15 @@ class L2tpIpsecTunnel(
         override fun receiveIsakmp(timeoutMs: Int): ByteArray? {
             checkReceiveAborted()
             return ikeQueue.poll(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        }
+
+        override fun deferForeignMessage(message: ByteArray) {
+            // Bounded and dropped on overflow rather than blocked on: the only thread that empties
+            // this is the very thread a rekey is blocking, so waiting for room here would deadlock
+            // the tunnel outright.
+            if (!deferredIkeQueue.offer(message)) {
+                log.w("dropping an ISAKMP message for a superseded SA; the deferred queue is full")
+            }
         }
     }
 

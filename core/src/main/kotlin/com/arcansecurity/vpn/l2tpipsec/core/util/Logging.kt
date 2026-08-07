@@ -5,6 +5,11 @@ enum class LogLevel { DEBUG, INFO, WARN, ERROR }
 /**
  * Sink for the stack's diagnostics. The Android app forwards it to `android.util.Log` and to the
  * in-app log screen; unit tests capture it or discard it.
+ *
+ * Nothing that reaches a sink is private. logcat is readable by the platform, and the log screen
+ * has a "copy" and a "share" action, so a message is a publication channel rather than a debugging
+ * aid kept to oneself. Callers are responsible for reducing a credential to [redacted] *before*
+ * handing it over; a sink cannot repair a message that already contains one.
  */
 fun interface VpnLogger {
     fun log(level: LogLevel, tag: String, message: String, error: Throwable?)
@@ -43,3 +48,15 @@ class Log(private val tag: String, private val sink: VpnLogger) {
     fun w(message: String, error: Throwable? = null) = sink.log(LogLevel.WARN, tag, message, error)
     fun e(message: String, error: Throwable? = null) = sink.log(LogLevel.ERROR, tag, message, error)
 }
+
+/**
+ * Stands in for a value that must stay unreadable in anything a human can see: a log line, an
+ * exception message, a `toString()` a crash reporter serialises.
+ *
+ * It reports only whether the secret is set, which is the part that is actually worth knowing when
+ * a connection fails. The length is withheld on purpose. Printing it is tempting — it looks
+ * harmless and it catches a stray space at the end of a pasted pre-shared key — but the length is
+ * exactly the parameter that decides how expensive guessing the key is, and a trace shared into a
+ * support ticket should not narrow that search.
+ */
+fun redacted(secret: String?): String = if (secret.isNullOrEmpty()) "<unset>" else "<redacted>"

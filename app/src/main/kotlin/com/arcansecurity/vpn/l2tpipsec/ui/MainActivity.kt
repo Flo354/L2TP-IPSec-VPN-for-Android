@@ -22,6 +22,11 @@ import com.arcansecurity.vpn.l2tpipsec.ui.theme.L2tpVpnTheme
  * an Intent the first time (the system consent dialog), and the service must not be started until
  * that dialog comes back `RESULT_OK`. Android 13+ additionally needs `POST_NOTIFICATIONS` for the
  * foreground service's notification to be visible.
+ *
+ * Nothing here touches storage. [VpnController.get] only allocates the state holder; the encrypted
+ * store is opened by a coroutine on [kotlinx.coroutines.Dispatchers.IO], and the UI shows a loading
+ * state until it is ready. Opening it inline in `onCreate`, as this class used to, put keystore
+ * work and file I/O on the main looper of a cold start.
  */
 class MainActivity : ComponentActivity() {
 
@@ -63,26 +68,26 @@ class MainActivity : ComponentActivity() {
                     controller = controller,
                     onConnect = ::requestConnect,
                     onDisconnect = ::requestDisconnect,
+                    onExit = ::finish,
                 )
             }
         }
-    }
-
-    override fun onStop() {
-        // Keep whatever was typed, even if the process is killed while in the background.
-        controller.persist()
-        super.onStop()
     }
 
     /**
      * The two system dialogs are chained rather than launched together: firing both in the same
      * frame stacks the VPN consent on top of the permission prompt, and whichever the user answers
      * first silently answers for the other.
+     *
+     * The profile check in front of them is asynchronous now — it probes the secret vault, which is
+     * keystore-backed file I/O and has no business running on the frame that handled the tap. The
+     * controller calls back on the main thread once it knows.
      */
     private fun requestConnect() {
-        if (!controller.prepareForConnect()) return
-        if (requestNotificationPermission()) return // its callback resumes the connect
-        requestConsentAndStart()
+        controller.requestConnect {
+            if (requestNotificationPermission()) return@requestConnect // its callback resumes
+            requestConsentAndStart()
+        }
     }
 
     private fun requestDisconnect() {
