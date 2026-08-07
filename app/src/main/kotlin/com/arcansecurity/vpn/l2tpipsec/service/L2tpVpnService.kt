@@ -34,7 +34,7 @@ import com.arcansecurity.vpn.l2tpipsec.platform.AndroidTunProvider
 import com.arcansecurity.vpn.l2tpipsec.platform.AndroidUdpSocketFactory
 import com.arcansecurity.vpn.l2tpipsec.platform.AppComponentsHolder
 import com.arcansecurity.vpn.l2tpipsec.ui.MainActivity
-import com.arcansecurity.vpn.l2tpipsec.ui.profile.wipe
+import com.arcansecurity.vpn.l2tpipsec.data.wipe
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -260,8 +260,8 @@ class L2tpVpnService : VpnService() {
                 }
             }
         } finally {
-            presharedKey.wipe()
-            password.wipe()
+            presharedKey?.wipe()
+            password?.wipe()
         }
     }
 
@@ -724,7 +724,7 @@ class L2tpVpnService : VpnService() {
         const val ACTION_CONNECT = "com.arcansecurity.vpn.l2tpipsec.action.CONNECT"
         const val ACTION_DISCONNECT = "com.arcansecurity.vpn.l2tpipsec.action.DISCONNECT"
 
-        /** Starts the tunnel from the profile stored in `ProfileRepository`. */
+        /** Starts the tunnel from the active profile in the `ProfileStore`. */
         fun connect(context: Context) {
             ContextCompat.startForegroundService(
                 context,

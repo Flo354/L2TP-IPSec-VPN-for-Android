@@ -19,7 +19,7 @@ internal class OpenedPreferences(
  * everyone who asks afterwards.
  *
  * This exists because the previous design opened `EncryptedSharedPreferences` from
- * `ProfileRepository.get()`, which ran synchronously inside `MainActivity.onCreate` and inside
+ * the old blocking profile repository, which ran synchronously inside `MainActivity.onCreate` and inside
  * `Service.onStartCommand`. That call generates or unwraps a keystore key and reads and decrypts a
  * file: tens of milliseconds on a good day, and on a cold start with a busy keymaster enough to
  * show up as a dropped frame or an ANR. Nothing here touches the disk until somebody suspends on

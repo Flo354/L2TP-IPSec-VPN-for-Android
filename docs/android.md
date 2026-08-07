@@ -4,12 +4,13 @@ Everything in `:app`: the `VpnService` lifecycle, the platform adapters, the rec
 the two traps that produce the most confusing symptoms in the whole project.
 
 See also: [architecture.md](architecture.md#platform-seams) for the seams `:app` implements,
-[configuration.md](configuration.md) for the profile, [troubleshooting.md](troubleshooting.md) for
-getting logs off a device.
+[configuration.md](configuration.md) for the profile, [security.md](security.md) for what protects
+the credentials, [troubleshooting.md](troubleshooting.md) for getting logs off a device.
 
 ## Contents
 
 * [Shape of the app module](#shape-of-the-app-module)
+* [Nothing touches storage on the main thread](#nothing-touches-storage-on-the-main-thread)
 * [The VpnService lifecycle](#the-vpnservice-lifecycle)
 * [Why protect() matters](#why-protect-matters)
 * [The TUN](#the-tun)
@@ -28,57 +29,121 @@ getting logs off a device.
 com.arcansecurity.vpn.l2tpipsec
   Labels.kt              human-readable names for every protocol enum, deliberately not in strings.xml
   data/
-    VpnProfile           the configuration record, free of Android types, converts to core's VpnConfig
-    ProfileValidation    per-field rules mirroring VpnConfig's require blocks
-    ProfileRepository    a single profile in EncryptedSharedPreferences, exposed as a StateFlow
+    VpnProfile           one saved connection: a stable id and the non-secret settings, Android-free
+    ProfileStore         the list of profiles as StateFlows; PreferenceProfileStore implements it
+    ProfileStorage       the key/value layout, the schema-1 → 2 migration; Android-free enough to fake
+    SecretVault          isSet / store / clear / clearAll — the credential store WITHOUT a getter
+    SecretReader         read — the single read path, handed only to the tunnel worker
+    EncryptedPreferences opens EncryptedSharedPreferences; the threat model is written up in it
+    LazyPreferences      opens the store exactly once, off the main thread, and never throws
+    VpnStorage           the entry point, and where the read/write split is handed out
   platform/
+    AppComponents        the store + vault + reader triple, built once per process, never on main
     AndroidUdpSocketFactory   protected sockets and a real local address
     AndroidTunProvider        VpnService.Builder
     AndroidLogger             logcat + an in-memory ring buffer
     LogRingBuffer             the buffer, Android-free so it unit-tests
   service/
     L2tpVpnService       the VpnService: worker thread, reconnect loop, connectivity, notification
+    ConnectPreparation   profile + secrets → VpnConfig, Android-free so it unit-tests
+    StartAction          which Intent action means what, Android-free so it unit-tests
     ReconnectPolicy      exponential backoff, Android-free so it unit-tests
     VpnStatusRepository  the one-way channel from the service to the UI
     VpnNotifications     the ongoing status notification
-  ui/                    Compose: MainActivity, the profile form, the status card, the logs sheet
+  ui/
+    MainActivity         the only Activity: consent, notification permission, the Compose tree
+    VpnController        the process-wide state holder: navigation, the edit session, the list
+    VpnApp               three screens over one Activity, plus the logs bottom sheet
+    profile/             the form's reducer, validator, secret-field model and naming helpers
+    screens/             Home, the profile list, the profile editor
+    components/          the text fields, the secret field, the status card
 ```
 
 **Nothing binds to the service.** The UI and the service communicate through process singletons —
-`VpnStatusRepository` for state, `AndroidLogger.shared` for the log, `ProfileRepository` for the
-configuration. There is no `onBind`, no AIDL, no broadcast. The Activity can be destroyed and
-recreated while the tunnel keeps running, and the status card is correct the instant it recomposes.
+`VpnStatusRepository` for state, `AndroidLogger.shared` for the log, `AppComponentsHolder` for the
+profiles and their credentials. There is no `onBind`, no AIDL, no broadcast. The Activity can be
+destroyed and recreated while the tunnel keeps running, and the status card is correct the instant it
+recomposes.
+
+## Nothing touches storage on the main thread
+
+This is a rule, not a preference, and it shapes several types that would otherwise look
+over-engineered.
+
+Opening the credential store generates or unwraps an Android Keystore key and then reads and decrypts
+a file: tens of milliseconds on a good day, and on a cold start with a busy keymaster enough to show
+up as a dropped frame or an ANR. It used to happen synchronously inside `MainActivity.onCreate` and
+inside `Service.onStartCommand`. It no longer happens on either.
+
+| Rule | How it is enforced |
+| --- | --- |
+| Construction is free | `VpnStorage` and `PreferenceProfileStore` allocate and schedule; `LazyPreferences` does not touch the disk until somebody **suspends** on `await()`. |
+| Every mutator is `suspend` | `ProfileStore.upsert` / `delete` / `setActive` do their work inside `Dispatchers.IO`. |
+| The UI never blocks | `AppComponentsHolder.get` is `suspend` and builds on `Dispatchers.IO`. `VpnController` launches on `Dispatchers.Main.immediate` and `withContext(IO)`s anything that reads. |
+| The service never blocks the looper | `AppComponentsHolder.getBlocking` exists **only** for the tunnel worker, which is already off the main thread and has no coroutine scope. Calling it from the main thread is a bug. |
+| Loading is a visible state, not a stall | `ProfileStore.state` starts at `LOADING` and the app draws a spinner ("Opening the profile store…") until it leaves it. |
+| Opening the editor is asynchronous | `SecretVault.isSet` reads a keystore-backed file, so `VpnController.openEditor` publishes `EditorState.Loading`, probes on `Dispatchers.IO`, and only then hands the form its answers. |
+| Pressing Connect is asynchronous | The pre-flight check probes the vault too, so `MainActivity.requestConnect` calls back on the main thread once the controller knows. |
+
+The one deliberately blocking call in the whole layer is `SecretReader.read`, and its KDoc says so:
+it waits for the store to be open and for any queued write to land, because returning `null` because
+a write had not finished would look to the user exactly like a wrong pre-shared key. It is called
+from the tunnel worker and nowhere else.
 
 ## The VpnService lifecycle
 
-The service accepts two actions and **no intent extras** — it loads the profile from storage itself,
-which is why the UI persists the draft before connecting.
+The service accepts **no intent extras** — it loads the active profile and its credentials from
+storage itself, on its own worker thread. What an incoming start command means is decided in
+`StartAction.kt`, kept free of Android types so the dispatch unit-tests:
 
 | Action | Effect |
 | --- | --- |
-| `…action.CONNECT` | validate the stored profile, then start the worker |
+| `…action.CONNECT` | start the worker |
+| `android.net.VpnService` | **also a connect** — this is how the platform starts always-on VPN, and the manifest advertises support for it, so treating it as anything else would leave always-on permanently broken |
 | `…action.DISCONNECT` | stop |
+| `null` (the system redelivered a command of its own) | keep a running tunnel, stop otherwise |
 | anything else | log and stop |
 
 `onStartCommand` calls the notification push **first, unconditionally**, before looking at the
 action: the service may have been launched with `startForegroundService`, in which case it owes the
 system a `startForeground()` call within a few seconds whatever it is about to do. It returns
-`START_NOT_STICKY`.
+`START_NOT_STICKY` — a VPN that silently reappears after the process was killed is worse than one the
+user restarts, and always-on does not rely on it because the platform restarts the service itself.
 
 Starting the tunnel, in order:
 
 1. Guard against a double connect with an atomic flag.
-2. Load the profile and validate it. An invalid profile is reported as an `INTERNAL` failure with the
-   joined messages and does not start anything.
-3. Set the log level from the profile's debug switch, clear the stop flag, reset the backoff.
-4. Publish `onStarting()`, push the notification, register the connectivity callback.
-5. Start **one** daemon thread, `l2tp-tunnel`, which runs the reconnect loop. `L2tpIpsecTunnel.run()`
-   blocks, so it must never be on the main looper.
+2. Clear the stop flag and reset the backoff.
+3. Publish `onStarting()`, push the notification.
+4. Start **one** daemon thread, `l2tp-tunnel`. `L2tpIpsecTunnel.run()` blocks, so it must never be on
+   the main looper.
+
+**Nothing is read in step 1–4.** Loading the active profile means opening a keystore-backed store,
+and reading its secrets means a second round of keystore work; both used to happen on the line that
+starts the tunnel, which is the main looper — and the system is timing the service against the few
+seconds it allows before it kills a foreground service that has not called `startForeground`.
+
+The worker's first job is therefore `loadConfiguration()`:
+
+1. Get `AppComponents` (blocking, but this is the worker).
+2. Wait for `ProfileStore.state` to leave `LOADING`, with a **15-second timeout**. Always-on VPN can
+   start the service during boot while the keystore is still warming up, so the wait is generous —
+   but finite, because a store that never becomes readable has to surface as a failure rather than
+   hang the service.
+3. Read the active profile's two secrets through `SecretReader`.
+4. `prepareConnect(profile, psk, password)` → `Ready(VpnConfig)` or `Rejected(reason)`.
+5. Wipe both `CharArray`s in a `finally`, whatever happened.
+
+A `Rejected` is a configuration problem: it is reported as an `INTERNAL` failure with that reason and
+**does not enter the retry loop**, because retrying will not conjure a pre-shared key.
+
+Only once that has succeeded does the worker register the connectivity callback and enter the
+reconnect loop. Registering it earlier would mean unregistering it on every rejected connect.
 
 The reconnect loop, per attempt:
 
 ```
-runOnce()  →  build VpnConfig, resolve the host, build the socket factory and TUN provider,
+runOnce()  →  resolve the host, build the socket factory and TUN provider,
               construct L2tpIpsecTunnel, call run() (blocking)
            →  Stopped   → leave the loop
            →  Ended     → treat as PEER_DISCONNECTED, retryable
@@ -86,8 +151,16 @@ runOnce()  →  build VpnConfig, resolve the host, build the socket factory and 
 publish the failure, decide whether to retry, sleep the backoff, go again
 ```
 
+The `VpnConfig` is built **once**, before the loop, and every attempt reuses it. That is what makes a
+profile edited mid-connection unable to half-apply itself to a live tunnel; the editor says as much
+on screen ("Changes here take effect the next time you connect"). Only the profile's name and the
+resolved server host are copied out for the notification.
+
 `onRevoke()` — the system or another VPN app took the permission — stops the tunnel.
-`onDestroy()` stops it, joins the worker with a timeout and unregisters the connectivity callback.
+`onDestroy()` stops it, unregisters the connectivity callback and leaves the foreground, in that
+order. It deliberately does **not** join the worker: `onDestroy` runs on the main looper, the thread
+can take seconds to unwind its polite teardown, and by then it owns nothing still open — blocking the
+looper on it would trade a leak we do not have for an ANR we would.
 
 ### The listener
 
@@ -163,9 +236,14 @@ Android 14 requires a typed foreground service and **there is no VPN type**, so 
     android:permission="android.permission.BIND_VPN_SERVICE">
     <intent-filter><action android:name="android.net.VpnService" /></intent-filter>
     <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-              android:value="@string/fgs_special_use_subtype" />
+              android:value="Maintains a user-initiated L2TP/IPsec VPN tunnel: …" />
 </service>
 ```
+
+The justification is spelled out **literally** in the manifest rather than behind `@string/…`: a
+resource reference survives the merge as an unresolved id, and this value exists to be read straight
+off the manifest by Google Play's tooling and by whoever reviews the app. The same words belong in
+the Play Console declaration.
 
 `exported="true"` looks alarming and is not: the service is gated behind `BIND_VPN_SERVICE`, which
 only the system holds, so no third-party app can reach it. Exporting it is what lets the platform
@@ -190,7 +268,9 @@ one action wired through `PendingIntent.getForegroundService` rather than `getSe
 tap can arrive while the app is in the background where a plain `startService` would be refused.
 
 Backups are disabled outright — the preferences hold an IKE pre-shared key and a PPP password, and
-neither cloud backup nor device-to-device transfer may carry them off the handset.
+neither cloud backup nor device-to-device transfer may carry them off the handset. That takes **two**
+declarations, `android:allowBackup="false"` and `res/xml/data_extraction_rules.xml`, because they
+cover different Android versions; see [security.md](security.md#backup-and-device-transfer).
 
 ## The connectivity-callback trap
 
@@ -285,22 +365,132 @@ unimplemented code path — because neither will succeed on a retry.
 
 ## Profile storage
 
-A single profile, stored in `EncryptedSharedPreferences` as flat key/value entries — no JSON, no
-database. Preference *names* are encrypted deterministically (AES-256-SIV, which is what makes
-lookups possible) and *values* with AES-256-GCM, both through androidx.security with the default
-master key in the Android keystore. The code never handles an IV or a nonce itself.
+A **list** of profiles with one marked active, stored in `EncryptedSharedPreferences` as flat
+key/value entries — no JSON, no database. Preference *names* are encrypted deterministically
+(AES-256-SIV, which is what makes lookups possible) and *values* with AES-256-GCM, both through
+androidx.security with a master key in the Android keystore. The code never handles an IV or a nonce
+itself. What that actually protects against is in [security.md](security.md#threat-model).
 
-**If the keystore refuses to give an encrypted store**, the repository logs a warning and falls back
-to plain private `SharedPreferences` under a different file name, exposes `usesEncryptedStorage =
-false`, and the UI shows a red banner saying the pre-shared key and password are stored unencrypted.
-Nothing is migrated between the two files, so a device that flips from one to the other appears to
-have lost its profile.
+### The layout
+
+```
+schema.version           2
+profile.order            id1,id2,id3          <- the list order, verbatim
+profile.active           id2
+profile.<id>.name        …                    <- one row per field, non-secret only
+profile.<id>.server      …
+…
+secret.<id>.psk          …                    <- owned by PreferenceSecretVault
+secret.<id>.password     …
+```
+
+The order is an explicit comma-separated string rather than a `StringSet`, because a `StringSet` comes
+back in hash order and the list would rearrange itself on every restart.
+
+A write replaces the whole profile namespace rather than patching the rows that changed — that is
+what makes a delete leave no orphan behind, and there are a handful of profiles at most, so it is one
+batched edit either way. The rows to drop come from the *previously stored order*, never from
+`SharedPreferences.getAll()`, which on an encrypted store decrypts every value — including both
+credentials of every profile — just to enumerate key names.
+
+Ids are random UUIDs. Sequential indices were rejected because an index is reused the moment a
+profile in the middle of the list is deleted, and the next profile to take it would inherit the
+deleted one's stored credentials.
+
+### The credential store
+
+The two secrets never appear on `VpnProfile`. They live under `secret.<id>.<kind>` in the same file,
+behind two interfaces over the same object:
+
+* **`SecretVault`** — `isSet` / `store` / `clear` / `clearAll` — is what the UI gets. There is no
+  getter, so a screen cannot display a saved credential. See
+  [security.md](security.md#the-never-reveal-guarantee).
+* **`SecretReader`** — `read` — is handed only to the tunnel worker.
+
+Writes are queued: `SecretVault` is called from click handlers and must not block, so `store` and
+`clear` park the value in memory and wake a flush on `Dispatchers.IO`. A value is therefore visible
+to `isSet` and to `read` immediately, and durable shortly after. **A flush that throws leaves the
+entry queued**, so the current process keeps working against a store that has stopped accepting
+writes; the log says so and the credential is gone after a restart.
+
+`isSet` is answered from an in-memory presence map, seeded by probing with `contains` per key — never
+by enumerating, for the `getAll` reason above. The map is seeded **before** the store publishes
+`READY`, because that is the moment the UI starts trusting `isSet`, and a form that opens with "no
+pre-shared key set" on a profile that has one is a bug report.
+
+### Failure is a state, not an exception
+
+`EncryptedSharedPreferences` throws `SecurityException` out of *every* getter once its keyset no
+longer matches the data on disk — a wiped or rotated master key, which is what a restore onto another
+handset or some OS upgrades leave behind. Every read and write in `data/` is wrapped, and the outcome
+is a state on `ProfileStore`:
+
+| `ProfileStoreState` | Meaning | What the UI does |
+| --- | --- | --- |
+| `LOADING` | the store has not been opened yet | a spinner; `isSet` is not yet meaningful |
+| `READY` | loaded. An empty list here is a first run, not a failure | the normal screens |
+| `UNREADABLE` | what was on disk could not be read, and the list is empty | a red banner saying the profiles were cleared and why |
+
+A failed read **discards everything rather than keeping what was readable**: every value in an
+encrypted store is sealed under the same keyset, so a failure is all-or-nothing in practice, and
+where it is not, a list showing half a profile is worse than an honest empty one. The first
+successful write puts the store back to `READY`.
+
+The flows are also updated whether or not a write lands. A store that will not take the write is no
+reason to refuse the connection the user is about to ask for with exactly those settings.
 
 Unknown or unparseable enum values fall back to the default with a warning rather than throwing, so a
-downgrade or a hand-edited store does not brick the app.
+downgrade or a hand-edited store does not brick the app. That is a *parse* failure, not a read
+failure, and it is handled per field.
 
-`VpnProfile.toString()` is overridden to redact the pre-shared key and the password. Nothing else
-stringifies them.
+### The plaintext fallback
+
+If the keystore refuses to give an encrypted store, `VpnStorage.open` logs a warning and falls back
+to plain private `SharedPreferences` under `vpn-profile`, `ProfileStore.usesEncryptedStorage` becomes
+`false`, and the home screen shows a red banner saying the pre-shared key and password are stored
+unencrypted.
+
+Falling back rather than failing is deliberate: the only screen that could fix a broken keystore is
+the one that would fail to open, and forcing a user to retype a pre-shared key on every restart ends
+with the key written down somewhere worse. The banner makes the trade visible.
+
+### The single-profile migration
+
+Schema 1 stored one profile at the top level with unprefixed keys, its pre-shared key under `psk` and
+its PPP password under `password`. Users have working setups in that shape, so the migration brings
+one forward as a single profile **with both credentials intact**.
+
+The order is the whole difficulty:
+
+1. Read the schema-1 profile — from the encrypted store, or, if that has nothing, from the plaintext
+   fallback file. The second source matters because a device whose keystore has *since started
+   working again* would otherwise open an empty encrypted store and silently lose the user's setup.
+2. `SecretVault.store` both credentials.
+3. **`flushNow()` — and only a confirmed durable write lets step 4 happen.** If it fails, the profile
+   is usable for this session and the migration is retried on the next start.
+4. Write the schema-2 rows, then delete the schema-1 keys **including the two plaintext secrets**.
+
+A migration interrupted anywhere before step 4 simply happens again next time: the migrated profile's
+id is the fixed string `legacy`, so repeating it produces the same profile rather than a second copy.
+
+The trigger is `version < 2` **and** an empty profile list. Both halves matter: the version alone
+would resurrect a migrated profile the user has since deleted if the schema-1 cleanup had failed, and
+emptiness alone would overwrite a schema-2 store the user has just emptied. A store with nothing to
+migrate gets the schema stamped so it is never looked at again.
+
+### Deleting
+
+`ProfileStore.delete` calls `SecretVault.clearAll(id)` **before** removing the profile row, so a
+store that dies halfway leaves an orphan row rather than an orphan credential. If the deleted profile
+was the active one, the profile that slid into its place becomes active, else the new last one, else
+none. The confirmation dialog says the credentials go with it and cannot be recovered.
+
+### Redaction
+
+`VpnProfile.toString()` is written out by hand even though there is nothing secret left to print, so
+that adding a secret to the class cannot leak it by default — and `VpnProfileTest` fails the build if
+a secret-shaped property appears on it at all. `VpnConfig.toString()` reduces both credentials to a
+presence marker with no length. See [security.md](security.md#redaction).
 
 ## Logging
 
@@ -317,34 +507,64 @@ from `:core`. See [troubleshooting.md](troubleshooting.md#getting-logs-off-a-dev
 
 ## Consent and the UI
 
-`VpnService.prepare()` returns an Intent the first time — the system consent dialog — and the service
-must not be started until it comes back `RESULT_OK`. The order in the Activity is:
+Three screens over one Activity — Home, the profile list, the profile editor — plus the logs on a
+bottom sheet. Navigation is a plain back stack in `VpnController` rather than a navigation library:
+there are three destinations, one of them has an argument, and the state holder already outlives the
+Activity, which is the only thing a library would have bought.
 
-1. Validate and **persist** the draft profile. This is how the service later finds it; the profile is
-   never passed in an Intent.
-2. On API 33+, request `POST_NOTIFICATIONS` if it is not granted. This is fire-and-forget — the
-   consent dialog is launched immediately after, so a first run queues two system dialogs.
+`VpnController` is a **process singleton, not a `ViewModel`**. The tunnel outlives the Activity by
+design, and the status the UI shows has to be correct the instant a recreated Activity recomposes.
+It holds no secret and there is no code path by which it could: the `SecretVault` it talks to can
+only answer "is one set" and be handed a replacement, and the characters of a replacement arrive as
+an argument to `saveEditor`, which wipes them before it returns.
+
+Home is the landing screen rather than the list, because most installations have exactly one profile
+and making those users walk through a list of one to reach the connect button would be paying for the
+rare case with the common one. The list is one tap away; tapping a row makes it active, and edit /
+duplicate / delete are behind the row's overflow so the primary gesture cannot be confused with a
+destructive one. The active profile is marked with a badge and deliberately **not** hoisted to the
+top of the list — a list that reorders itself the moment you tap a row makes it very easy to activate
+the wrong profile twice in a row.
+
+The connect handshake: `VpnService.prepare()` returns an Intent the first time — the system consent
+dialog — and the service must not be started until it comes back `RESULT_OK`.
+
+1. **A pre-flight check on the active profile**, asynchronously, because it probes the vault. No
+   active profile, or a failed validation, produces a sentence on screen (and opens the editor)
+   instead of a foreground service that starts and immediately fails. The service re-checks all of
+   this on its own worker anyway — it has to, since always-on VPN can start it with no UI at all.
+2. On API 33+, request `POST_NOTIFICATIONS` if it is not granted. **The two system dialogs are
+   chained, not launched together**: firing both in the same frame stacks the VPN consent on top of
+   the permission prompt, and whichever the user answers first silently answers for the other. Either
+   answer carries on to step 3 — the permission only decides whether the notification is visible, not
+   whether the foreground service may run.
 3. `VpnService.prepare()`; launch the consent Intent if non-null, otherwise start the service
    directly.
 
-The draft is also persisted in `onStop()`, so whatever was typed survives the process being killed in
-the background. That persists an *invalid* draft too — validation only gates connecting, not saving.
+**There is no draft profile any more.** Saving is explicit, and the connect path reads what was
+saved; nothing is persisted behind the user's back and nothing invalid is ever written. Editing a
+profile while the tunnel is up is allowed, with a line on the form saying the changes apply on the
+next connect.
 
 The single button follows the tunnel state: Connect when idle or failed, Cancel with a spinner while
-the handshake is in progress, Disconnect when connected. The profile form is editable only when idle
-or failed.
+the handshake is in progress, Disconnect when connected. It is disabled when there is no active
+profile.
 
 ## Limitations
 
-* **No always-on / boot support beyond what the platform gives for free.** The service is bindable by
-  the platform, but there is no boot receiver and no explicit always-on handling.
+* **No always-on / boot support beyond what the platform gives for free.** The service handles the
+  `android.net.VpnService` start action, so always-on works, but there is no boot receiver and no
+  explicit always-on state of its own.
 * **No per-app split tunnelling.** `addDisallowedApplication`, `addAllowedApplication` and
   `allowBypass` are never called; the tunnel applies to every app.
-* **One profile**, not a list.
+* **Profiles cannot be exported or imported.** There is no file format and no share action — which is
+  also the only reason nobody has had to decide what such a file would do about the credentials.
 * **The host is resolved twice** — once by the service, once by `:core` — so a DNS change between the
   two would be picked up inconsistently. Harmless in practice, but it is redundant work.
-* **A decryption failure of an individual stored value is not handled.** If the keystore rotates
-  under an existing encrypted store, the exception propagates out of the repository's constructor.
-  The handled case is the store failing to open at all.
+* **A keystore that rotates under an existing store loses every profile**, not just the unreadable
+  value. That is deliberate (see above), but it is a real data loss and the banner is the only
+  warning the user gets.
+* **`androidx.security-crypto` is deprecated** and the migration off it has been declined for now;
+  the reasoning is in [security.md](security.md#androidxsecurity-crypto-is-deprecated).
 * **`VpnConfig.debugLogging` is carried into `:core` but never read there.** The debug level is set on
-  the Android logger instead, so the field currently does nothing.
+  the Android logger instead, so the field currently does nothing inside the stack.

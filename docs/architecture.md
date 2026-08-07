@@ -4,7 +4,18 @@ How the client is put together: the modules, the layering, the threads, and the 
 protocol stack free of Android.
 
 See also: [protocol.md](protocol.md) for what happens on the wire, [android.md](android.md) for the
-`VpnService` side, [rekeying.md](rekeying.md) for the maintenance thread's other job.
+`VpnService` side, [rekeying.md](rekeying.md) for the maintenance thread's other job,
+[security.md](security.md) for the credential handling.
+
+## Contents
+
+* [Modules](#modules)
+* [The layering](#the-layering)
+* [Threading model](#threading-model)
+* [Platform seams](#platform-seams)
+* [The data layer](#the-data-layer)
+* [The connect sequence](#the-connect-sequence)
+* [Known limitations](#known-limitations)
 
 ## Modules
 
@@ -13,7 +24,7 @@ Two Gradle modules plus a test lab.
 | Module | Kind | Depends on | Why it exists |
 | --- | --- | --- | --- |
 | `:core` | plain `kotlin-jvm` library | nothing but the JDK | The entire protocol stack. No Android SDK reference anywhere, which is what lets it run in ordinary JVM unit tests and be driven against a real server from JUnit. |
-| `:app` | `com.android.application` | `:core` | `VpnService`, platform adapters, encrypted profile storage, Compose UI. |
+| `:app` | `com.android.application` | `:core` | `VpnService`, platform adapters, encrypted profile and credential storage, Compose UI. |
 | `testserver/` | Docker | — | A real strongSwan + xl2tpd + pppd LNS configured like the target router. See [testing.md](testing.md). |
 
 The rule that keeps this honest: **`:core` must never reference an Android type.** Everything the
@@ -22,8 +33,12 @@ the interesting code — key derivation, ISAKMP encoding, ESP, the L2TP control 
 automaton — is testable without a device or an emulator, and that a protocol bug can be reproduced
 in a unit test rather than by watching a phone.
 
-`:app` classes that hold no Android types (`VpnProfile`, `ProfileValidation`, `ReconnectPolicy`,
-`LogRingBuffer`) are deliberately written that way so they can be unit-tested too.
+The same discipline is applied one level up wherever it is affordable. `:app` classes that hold no
+Android types — `VpnProfile`, the form reducer and validator in `ui/profile/`, `ConnectPreparation`,
+`StartAction`, `ReconnectPolicy`, `LogRingBuffer` — are deliberately written that way so they can be
+unit-tested too, and the preference layout in `data/ProfileStorage.kt` touches `SharedPreferences`
+only through the interface, so reading, writing and the schema migration run against a fake on a
+plain JVM: no `Context`, no keystore, no Robolectric.
 
 ### `:core` packages
 
@@ -110,7 +125,7 @@ flowchart LR
 | the caller's thread | `:app`'s `l2tp-tunnel` worker | Runs the whole connect sequence, then becomes the **downlink pump**: dequeues L2TP packets, drives `L2tpTunnel` and `PppSession`, writes IP packets to the TUN, and finally sends the polite teardown. | `run()` returns |
 | `l2tp-vpn-reader` | tunnel | The only reader of the socket. Classifies each datagram and pushes it onto `ikeQueue` (32 slots) or `l2tpQueue` (256 slots). Decrypts ESP, demultiplexing on the SPI. | stop requested, socket closed, or too many consecutive read failures |
 | `l2tp-vpn-uplink` | tunnel | Blocking-reads the TUN, wraps each IP packet in PPP + L2TP + UDP + ESP and sends it. | TUN closed (which is how it is unblocked) |
-| `l2tp-vpn-maintenance` | tunnel | Owns everything ISAKMP once the tunnel is up: drains `ikeQueue`, runs both rekey schedules, retires superseded SAs, sends NAT keepalives. | stop requested or a maintenance failure |
+| `l2tp-vpn-maintenance` | tunnel | Owns everything ISAKMP once the tunnel is up: drains the deferred queue and then `ikeQueue`, runs both rekey schedules, retires superseded SAs, sends NAT keepalives. | stop requested or a maintenance failure |
 | `l2tp-vpn-connect-watchdog` | tunnel | Bounds the *whole* establishment, not just individual layers. Closes the socket if `CONNECTED` is not reached before `connectTimeoutMs`, recording which state stalled. | `CONNECTED` reached, or the deadline fires |
 | `l2tp-vpn-reaper` | tunnel, on `stop()` | Sleeps a grace period, then closes the socket and interrupts the reader. Backstop only. | after one sleep |
 
@@ -182,6 +197,64 @@ NAT-D hashes are computed over it. A socket bound to the wildcard address report
 would make the peer's NAT detection nonsense. `connect()` on a UDP socket is a purely local
 operation — no packet leaves the device — so the probe is free.
 
+## The data layer
+
+`:app`'s `data/` package has one job — persist the saved connections — and one seam that is worth
+more than the rest of the package put together: **which callers can read a credential.**
+
+```
+                      VpnStorage        opens nothing until somebody suspends
+                           │
+        ┌──────────────────┼──────────────────────┐
+        │                  │                      │
+  profileStore()     secretVault()          secretReader()
+        │                  │                      │
+        ▼                  ▼                      ▼
+┌────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ ProfileStore   │  │ SecretVault      │  │ SecretReader     │
+│                │  │                  │  │                  │
+│ profiles       │  │ isSet            │  │ read             │
+│ activeProfileId│  │ store            │  │                  │
+│ state          │  │ clear            │  │ NO OTHER CALLER  │
+│ upsert/delete  │  │ clearAll         │  │                  │
+└────────────────┘  └────────┬─────────┘  └────────┬─────────┘
+  UI + service        UI only│                     │service only
+                            ┌▼─────────────────────▼┐
+                            │ PreferenceSecretVault │  one object, one cache
+                            └───────────┬───────────┘
+                                        │
+                            ┌───────────▼───────────┐
+                            │ LazyPreferences       │
+                            │  EncryptedShared-     │
+                            │  Preferences, or the  │
+                            │  plaintext fallback   │
+                            └───────────────────────┘
+```
+
+| Type | Given to | Why it exists |
+| --- | --- | --- |
+| `ProfileStore` | UI and service | The saved connections as `StateFlow`s. Nothing on it blocks and nothing on it throws: loading is a state (`LOADING` / `READY` / `UNREADABLE`), and every mutator is `suspend`. |
+| `SecretVault` | **UI only** | Can say a secret exists and can replace or delete one. Has no getter, so no screen can display a stored credential. |
+| `SecretReader` | **service only** | The single read path. `ui/` does not import the type anywhere. |
+| `AppComponents` | both | Wires the three together once per process, off the main thread. It is the only place outside `data/` that names the factory. |
+
+The two secret interfaces are views of the *same* `PreferenceSecretVault`, so there is one copy of
+the data and one cache; the separation that matters is at the hand-out point, not two stores. The
+full argument, and where the guarantee still leaks, is in
+[security.md](security.md#the-never-reveal-guarantee).
+
+Three consequences worth knowing before changing anything here:
+
+* **`VpnProfile` is a plain record with no secret.** The only way from a profile to a `VpnConfig` is
+  `prepareConnect`, which takes the two `CharArray`s as parameters — so the type system, not a
+  convention, is what keeps the credentials out of the object graph the UI holds.
+* **Nothing opens a store on the caller's thread.** `LazyPreferences` defers the first keystore
+  access until somebody suspends on it. See
+  [android.md](android.md#nothing-touches-storage-on-the-main-thread).
+* **Two locks, always taken in the same order.** Both the store and the vault open the preferences
+  *outside* their own lock, because taking the two in opposite orders would deadlock on the first,
+  slow keystore access.
+
 ## The connect sequence
 
 `L2tpIpsecTunnel.connectAndPump()` walks the states in `TunnelState`, reporting each one through
@@ -226,9 +299,16 @@ Stated plainly, because discovering these from the code costs an afternoon each.
   it; liveness relies on the L2TP HELLO and the LCP echoes instead.
 * **No per-app split tunnelling and no split routing.** The TUN takes `0.0.0.0/0` and applies to
   every app. `addDisallowedApplication` / `allowBypass` are never called.
-* **One profile.** The storage layer holds a single profile record, not a list.
-* **No always-on / boot reconnect.** The service is exported and gated behind `BIND_VPN_SERVICE` so
-  the platform *can* bind it for always-on VPN, but nothing else supports that mode explicitly.
+* **Only one tunnel at a time.** The service owns a single `L2tpIpsecTunnel`; multiple profiles can
+  be saved but only the active one connects.
+* **No import or export of profiles.** Which also means nobody has had to decide what such a file
+  would do about the credentials.
+* **Credential storage has not been verified on a device.** It is read-only review plus plain-JVM
+  tests against a fake store, because `AndroidKeyStore` does not exist off-device. See
+  [security.md](security.md#what-is-not-claimed).
+* **No always-on / boot reconnect state of its own.** The service is exported, gated behind
+  `BIND_VPN_SERVICE` and handles the platform's `android.net.VpnService` start action, so always-on
+  works; there is no boot receiver and nothing else supports that mode explicitly.
 * **`TunnelErrorKind.NETWORK_UNREACHABLE` is declared but never produced.** A dead network surfaces
   as `IKE_NO_RESPONSE` instead.
 * **Only CBC ciphers.** Combined-mode ciphers (AES-GCM) would need a different ESP layout and the

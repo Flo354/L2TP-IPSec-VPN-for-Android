@@ -12,11 +12,10 @@ import com.arcansecurity.vpn.l2tpipsec.ui.profile.SecretIntent
 import com.arcansecurity.vpn.l2tpipsec.ui.profile.applySecretCommit
 import com.arcansecurity.vpn.l2tpipsec.ui.profile.commit
 import com.arcansecurity.vpn.l2tpipsec.ui.profile.duplicateOf
-import com.arcansecurity.vpn.l2tpipsec.ui.profile.newProfileId
 import com.arcansecurity.vpn.l2tpipsec.ui.profile.newProfileName
 import com.arcansecurity.vpn.l2tpipsec.ui.profile.toProfile
 import com.arcansecurity.vpn.l2tpipsec.ui.profile.validate
-import com.arcansecurity.vpn.l2tpipsec.ui.profile.wipe
+import com.arcansecurity.vpn.l2tpipsec.data.wipe
 import com.arcansecurity.vpn.l2tpipsec.ui.profile.withAllErrorsShown
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -148,7 +147,7 @@ class VpnController private constructor(private val appContext: Context) {
             val components = AppComponentsHolder.get(appContext)
             val existing = profileId?.let { id -> _profiles.value.firstOrNull { it.id == id } }
             val profile = existing ?: VpnProfile(
-                id = newProfileId(),
+                id = VpnProfile.newId(),
                 name = newProfileName(_profiles.value.map { it.name }),
             )
             val presence = withContext(Dispatchers.IO) {
@@ -186,8 +185,8 @@ class VpnController private constructor(private val appContext: Context) {
         val current = _editor.value as? EditorState.Ready ?: return
         val validation = current.form.validate()
         if (!validation.isValid) {
-            typedPresharedKey.wipe()
-            typedPassword.wipe()
+            typedPresharedKey?.wipe()
+            typedPassword?.wipe()
             _editor.value = EditorState.Ready(current.form.withAllErrorsShown())
             _message.value = validation.errors.first().message
             return
@@ -224,8 +223,8 @@ class VpnController private constructor(private val appContext: Context) {
             } finally {
                 // Belt and braces: applySecretCommit already wipes what it was given, but a throw
                 // before it is reached must not leave a key sitting in a live array.
-                typedPresharedKey.wipe()
-                typedPassword.wipe()
+                typedPresharedKey?.wipe()
+                typedPassword?.wipe()
                 _saving.value = false
             }
         }
@@ -266,8 +265,9 @@ class VpnController private constructor(private val appContext: Context) {
         scope.launch {
             val components = AppComponentsHolder.get(appContext)
             withContext(Dispatchers.IO) {
+                // delete() clears the profile's secrets itself; doing it here as well would let
+                // the UI wipe credentials for an id the store had refused to remove.
                 components.profiles.delete(profile.id)
-                components.vault.clearAll(profile.id)
             }
             _message.value = "Deleted '${profile.name}'"
         }

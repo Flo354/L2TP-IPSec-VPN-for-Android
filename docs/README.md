@@ -11,8 +11,9 @@ depth behind it.
 | [architecture.md](architecture.md) | Module layout, the layering, the threading model, who owns which state, the platform seams, known limitations |
 | [protocol.md](protocol.md) | What is implemented at each layer with RFC references, and the non-obvious decisions: forced UDP encapsulation, transport mode, the zero inner checksum, NAT-T dialects, MTU |
 | [rekeying.md](rekeying.md) | SA lifetimes, why the schedule follows the responder, the 75–85 % jittered deadline, make-before-break, peer-initiated Quick Mode, sequence exhaustion, what is deliberately not covered |
-| [android.md](android.md) | `VpnService` lifecycle, why `protect()` matters, foreground service type and permissions, the reconnect policy, the connectivity-callback trap and the teardown-ordering trap |
-| [configuration.md](configuration.md) | Every field of `VpnConfig` and `VpnProfile`: meaning, default, when to change it, and how the two map onto each other |
+| [android.md](android.md) | `VpnService` lifecycle, why `protect()` matters, foreground service type and permissions, profile and credential storage, the main-thread rules, the reconnect policy, the connectivity-callback trap and the teardown-ordering trap |
+| [configuration.md](configuration.md) | Every field of `VpnConfig` and `VpnProfile`, how the two secrets are addressed and edited, the validation rules, and how a profile becomes a `VpnConfig` |
+| [security.md](security.md) | What is stored where and what actually protects it, the threat model, the never-reveal guarantee and where it still leaks, backup and transfer, the deliberate weaknesses — and what is *not* claimed |
 | [testing.md](testing.md) | The test strategy, the Docker lab, how to run each suite including the rekey labs, how the live tests self-skip |
 | [troubleshooting.md](troubleshooting.md) | Getting useful logs off a device, what each `TunnelErrorKind` means, a table of observed symptoms and their causes |
 | [interoperability.md](interoperability.md) | The Livebox Pro's actual settings and how they map onto the client's defaults, plus what the lab taught us about strongSwan, xl2tpd and pppd |
@@ -34,7 +35,16 @@ depth behind it.
 [android.md](android.md) — that symptom has two well-known causes, both documented there.
 
 **"I need to add a setting."**
-[configuration.md](configuration.md) → [android.md](android.md).
+[configuration.md](configuration.md) → [android.md](android.md#profile-storage).
+
+**"Where is the pre-shared key kept, and how safe is it?"**
+[security.md](security.md) → [android.md](android.md#profile-storage). Start with the threat model:
+it is what decides whether any of the improvements listed there are worth doing.
+
+**"I want to touch anything that handles a credential."**
+[security.md](security.md#the-never-reveal-guarantee) first, then
+[configuration.md](configuration.md#the-two-secrets). The rule you will run into is that no type
+reachable from `ui/` can read a stored secret, and that is on purpose.
 
 ## Conventions used here
 

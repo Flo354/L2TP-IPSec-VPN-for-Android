@@ -48,7 +48,7 @@ adb logcat -s L2TP.Service L2TP.Tun      # the Android side
 | `L2TP.ppp` | LCP, authentication, IPCP |
 | `L2TP.UdpSocket` | socket creation, `protect()`, the local address |
 | `L2TP.Tun` | the `VpnService.Builder` result |
-| `L2TP.Profiles` | profile storage, including the unencrypted-fallback warning |
+| `L2TP.Profiles` | profile and credential storage: how many profiles loaded, the schema migration, the unencrypted-fallback warning, and any store that refused a read or a write |
 
 ### Without a cable
 
@@ -59,8 +59,15 @@ IKE negotiation against a consumer router usually happens on a phone with no cab
 
 The share button produces plain text, which is the right thing to attach to a bug report.
 
-**Secrets are never logged.** The pre-shared key and the password are redacted even in the profile's
-own `toString()`. Key material derived from them is not printed either.
+**Secrets are never logged, and the log is designed on the assumption that it will be shared.** The
+pre-shared key and the password reduce to `<redacted>` or `<unset>` in `VpnConfig.toString()` —
+**never a length**, because the length is what sets the cost of guessing a key. `VpnProfile` holds no
+credential to print in the first place. Key material derived from them is not printed either, and the
+bodies of L2TP AVPs and PPP control packets are summarised rather than dumped, because a PAP
+Authenticate-Request body *is* the cleartext password. See [security.md](security.md#redaction).
+
+A corollary worth knowing when reading a log: **a credential problem never names the credential.**
+"The stored PRESHARED_KEY for profile `<id>` could not be read" is as specific as it gets.
 
 ## Reading the log
 
@@ -154,8 +161,20 @@ Real symptoms, from the lab and from the target router.
 | **The tunnel dies a few seconds after every rekey** | The peer's routine Delete of the *superseded* SA was mistaken for a teardown of the live one | See [rekeying.md](rekeying.md#telling-deletes-apart) |
 | A brief gap in traffic right after a rekey | The superseded inbound SA was retired too early, or inbound was demultiplexed on "the current SA" instead of on the SPI | See [rekeying.md](rekeying.md#make-before-break); raise `saOverlapMs` for a slow peer |
 | IPv6 traffic bypasses the VPN | `blockIpv6` turned off on a dual-stack network | Turn it back on |
-| A red banner: the pre-shared key and password are stored unencrypted | The device keystore refused to provide an encrypted store | The app falls back to private preferences and says so. Nothing is migrated between the two stores, so the profile may also look empty |
 | Debug lines missing after enabling the switch | The level is applied when a connection starts | Reconnect |
+
+### Profiles and credentials
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| **A red banner: the pre-shared key and password are stored unencrypted** | The device keystore refused to give an encrypted store, so the app fell back to plaintext private preferences and said so | Nothing to do on the client. If the keystore later starts working, the app reads the fallback file once and brings the profile forward, so the setup is not lost. See [security.md](security.md#the-plaintext-fallback-still-persists-credentials) |
+| **A red banner: the saved profiles could not be decrypted and have been cleared** | The master key no longer matches the encrypted store — a restore onto another handset, or some OS upgrades. `EncryptedSharedPreferences` then throws out of *every* getter | The profiles are genuinely gone; enter them again. The store starts persisting from the first successful write. This is `ProfileStoreState.UNREADABLE`, and the failure is all-or-nothing on purpose |
+| **A duplicated profile will not connect: "A pre-shared key is required"** | Duplication copies no credentials, and cannot: they are filed under the original profile's id in a store the UI cannot read | Enter the key and password on the copy. The snackbar says so at duplication time |
+| **The editor shows "no pre-shared key set" on a profile that has one** | `SecretVault.isSet` is only meaningful once the store has left `LOADING` | Should be impossible — the presence map is seeded before the store publishes `READY`. If it happens, that ordering is the thing to look at |
+| **`Refusing to connect: The profile store did not finish loading`** | The worker waited 15 s for the store to leave `LOADING` and gave up. Usually a keystore that is still warming up during boot, e.g. an always-on VPN start | Connect again once the device has settled. A store that *never* becomes readable is the row above |
+| **`Refusing to connect: No VPN profile is selected`** | Every profile was deleted, or the store came up `UNREADABLE` | Create one; the first profile created becomes the active one automatically |
+| A credential the user just entered works, then is gone after a restart | The store refused the write. The vault keeps it in memory for the process so the session still works, and logs it | Look for "could not be written to the store" under `L2TP.Profiles`. Usually the same keystore failure as the second row |
+| An old single-profile install comes back without its credentials | The schema-1 migration ran but its credential write failed | It is retried on every start until it succeeds — the schema-1 keys are only dropped after the credentials are confirmed on disk. Check `L2TP.Profiles` for the migration lines |
 
 ## Isolating a layer
 

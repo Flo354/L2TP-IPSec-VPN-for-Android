@@ -224,7 +224,7 @@ class ProfileFormStateTest {
         assertNull(state.validate()[ProfileField.DNS_SERVERS])
         assertEquals(
             listOf("9.9.9.9", "192.168.1.1", "2001:db8::1"),
-            state.profile.dnsServerList(),
+            state.profile.dnsServerList,
         )
     }
 

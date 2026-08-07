@@ -235,7 +235,7 @@ class ProfileStoreTest {
     /**
      * The crash this guards against: `EncryptedSharedPreferences` throws `SecurityException` out of
      * every getter once its keyset no longer matches the data, which propagated out of
-     * `ProfileRepository`'s constructor and killed the app in `Activity.onCreate` — with no way for
+     * the old profile repository's constructor and killed the app in `Activity.onCreate` — with no way for
      * the user to reach the screen that would let them retype the profile.
      */
     @Test

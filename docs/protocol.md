@@ -468,7 +468,7 @@ Echo-Request disables keepalives rather than failing.
 | Protocol | RFC | Notes |
 | --- | --- | --- |
 | PAP | RFC 1334 | **Client-initiated**: the Authenticate-Request goes out as soon as LCP opens, without waiting. Its own identifier space. Retransmitted up to a small budget. |
-| CHAP-MD5 | RFC 1994 | Response is `MD5(id | password | challenge)`. The challenge length is *not* fixed — real servers use anything from 16 to 24 bytes. |
+| CHAP-MD5 | RFC 1994 | Response is `MD5(id \| password \| challenge)`. The challenge length is *not* fixed — real servers use anything from 16 to 24 bytes. |
 | MS-CHAPv2 | RFC 2759 | Needs MD4, which the JDK does not provide, so it is implemented here. |
 
 MS-CHAPv2 response layout (RFC 2759 §4), 49 bytes:

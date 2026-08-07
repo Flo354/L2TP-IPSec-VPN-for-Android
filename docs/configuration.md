@@ -2,17 +2,29 @@
 
 Every knob, what it means, what it defaults to, and when you would change it.
 
-There are two records. `VpnConfig` (in `:core`) is what the protocol stack reads. `VpnProfile` (in
-`:app`) is what the user edits and what is persisted; it exposes a subset of `VpnConfig` and converts
-to it. Everything `VpnProfile` does not expose stays at its `VpnConfig` default.
+There are three records, and the split between them is the important part:
+
+| Record | Module | Holds |
+| --- | --- | --- |
+| `VpnConfig` | `:core` | everything the protocol stack reads, **including the two credentials** |
+| `VpnProfile` | `:app` `data/` | what the user edits and what is persisted — **no secret of any kind** |
+| `SecretVault` / `SecretReader` | `:app` `data/` | the pre-shared key and the PPP password, keyed by profile id |
+
+`VpnProfile` exposes a subset of `VpnConfig`; everything it does not expose stays at its `VpnConfig`
+default. A `VpnConfig` is assembled at connect time from a profile plus the two secrets read out of
+the vault, and nowhere else.
 
 See also: [protocol.md](protocol.md) for what these values do on the wire,
-[android.md](android.md#profile-storage) for how the profile is stored.
+[android.md](android.md#profile-storage) for how profiles are stored,
+[security.md](security.md) for what protects the credentials.
 
 ## Contents
 
+* [Profiles and secrets are separate](#profiles-and-secrets-are-separate)
 * [VpnProfile — what the user can set](#vpnprofile--what-the-user-can-set)
+* [The two secrets](#the-two-secrets)
 * [Validation rules](#validation-rules)
+* [How a profile becomes a VpnConfig](#how-a-profile-becomes-a-vpnconfig)
 * [VpnConfig — what the stack reads](#vpnconfig--what-the-stack-reads)
 * [Phase1Proposal and Phase2Proposal](#phase1proposal-and-phase2proposal)
 * [Identity](#identity)
@@ -20,20 +32,47 @@ See also: [protocol.md](protocol.md) for what these values do on the wire,
 * [Fields VpnProfile does not expose](#fields-vpnprofile-does-not-expose)
 * [Constants that are not configurable](#constants-that-are-not-configurable)
 
+## Profiles and secrets are separate
+
+The pre-shared key and the PPP password used to be two more `String` fields on `VpnProfile`. They are
+not any more, and the separation is structural rather than a convention:
+
+* `VpnProfile` is a plain record with a stable `id` and the non-secret settings. Anything holding a
+  profile — a text field, a `copy()`, a crash reporter walking the object graph — can reach nothing
+  sensitive, because there is nothing sensitive to reach.
+* The credentials live in `SecretVault`, which the UI is handed and which **has no getter**. It can
+  say whether a secret exists (`isSet`) and replace or delete one (`store`, `clear`, `clearAll`).
+* `SecretReader` — one `read` method — is the single read path, and only the tunnel worker is given
+  one.
+
+The consequence for anyone extending the form: **you cannot pre-fill a saved credential**, because
+no code under `ui/` can obtain one. The form shows a fixed placeholder with **Replace** and **Clear**
+instead. See [security.md](security.md#the-never-reveal-guarantee).
+
 ## VpnProfile — what the user can set
 
-Deliberately free of Android types so it can be unit-tested on a plain JVM. Its `toString()` redacts
-the pre-shared key and the password.
+Deliberately free of Android types so it can be unit-tested on a plain JVM. Its `toString()` is
+written out by hand even though there is nothing secret left to print, so that *adding* a secret to
+the class cannot leak it by default.
+
+### Identity of the profile itself
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `id` | `String` | `VpnProfile.newId()` — a random UUID | Stable identity. Keys this profile's rows in the preference store **and** its entries in the vault. Never reused: recycling one would hand a new profile the previous tenant's credentials, which is why it is a UUID and not a list index. |
+| `name` | `String` | `"L2TP/IPsec"` | Display name, also the `VpnService.Builder` session label shown in system settings. Must not be blank. |
+
+`displayName` falls back to the server address and then to `DEFAULT_NAME` for a profile the user
+never named.
 
 ### Connection
 
 | Field | Type | Default | Meaning / when to change |
 | --- | --- | --- | --- |
-| `name` | `String` | `"L2TP/IPsec"` | Display name, also the `VpnService.Builder` session label shown in system settings. Cosmetic. |
 | `server` | `String` | `""` | Host name or literal IPv4 address of the concentrator. **Required.** Trimmed before use. |
-| `presharedKey` | `String` | `""` | IKE pre-shared key. **Required.** Stored encrypted, never logged. Passed through verbatim — leading/trailing spaces are *not* stripped, because they may be part of the key. |
-| `username` | `String` | `""` | PPP user name. Trimmed. |
-| `password` | `String` | `""` | PPP password. Passed through verbatim. Stored encrypted, never logged. |
+| `username` | `String` | `""` | PPP user name. **Not a secret** — it is shown in the profile list and can appear in the log. Trimmed. |
+
+The pre-shared key and the password are **not** fields here; see [The two secrets](#the-two-secrets).
 
 ### Phase 1 (ISAKMP SA)
 
@@ -68,14 +107,28 @@ the pre-shared key and the password.
 | `identityType` | `IkeIdentityType` | `AUTO_IPV4` | ISAKMP identity type. `AUTO_IPV4` sends the socket's real local address, which is what road-warrior clients do. Change it only for a peer that keys its PSK on a named identity. |
 | `identityValue` | `String` | `""` | The identity payload contents. Ignored when the type is `AUTO_IPV4`; **required** otherwise. Trimmed. |
 | `forceUdpEncapsulation` | `Boolean` | `true` | Advertise a bogus source NAT-D hash so the peer always encapsulates ESP in UDP/4500. **Do not turn this off** unless you are deliberately testing a peer's behaviour: an unrooted Android app cannot send or receive plain ESP, so the tunnel will negotiate and then carry nothing. See [protocol.md](protocol.md#why-encapsulation-is-forced). |
-| `debugLogging` | `Boolean` | `false` | Raises the Android logger to `DEBUG`, which adds per-packet lines. Turn on when reproducing a handshake problem, off afterwards — it is noisy. |
+| `debugLogging` | `Boolean` | `false` | Raises the Android logger to `DEBUG`, which adds per-packet lines. Applied when a connection starts, so it takes effect on the next connect. Turn on when reproducing a handshake problem, off afterwards — it is noisy. |
 
-### Derived properties
+### Derived values
+
+Two free-text fields need interpreting before the stack can use them. Both are computed properties
+on `VpnProfile` itself, so the form validator and the service's connect path cannot drift apart:
 
 | Property | Definition |
 | --- | --- |
-| `dnsServerList` | `dnsServers` split on `[,;\s]+`, trimmed, empties dropped |
-| `localIdentity` | `IkeIdentity(AUTO_IPV4, "")` when the type is `AUTO_IPV4`, otherwise `IkeIdentity(type, identityValue.trim())` |
+| `VpnProfile.dnsServerList` | `dnsServers` split on `[,;\s]+`, trimmed, empties dropped |
+| `VpnProfile.localIdentity` | `IkeIdentity(AUTO_IPV4, "")` when the type is `AUTO_IPV4`, otherwise `IkeIdentity(type, identityValue.trim())` |
+| `VpnProfile.displayName` | `name`, falling back to `server`, then to the default name |
+
+`ui/profile/ProfileListModel.kt` holds the list-shaped helpers: `orderedForDisplay` (by lower-cased
+name under `Locale.ROOT`, then by id, so the order cannot change under a travelling user),
+`duplicateNameFor` (`Home` → `Home (copy)` → `Home (copy 2)`, without piling up suffixes) and
+`newProfileName`.
+
+> **Maintenance note.** `VpnProfile` also carries member equivalents (`dnsServerList`,
+> `localIdentity`) and a `toVpnConfig` / `buildVpnConfig` pair, none of which the app currently
+> calls — the live path is `prepareConnect` below. They are covered by their own tests, so both
+> copies compile and pass; if you change a rule, change it in both or delete one.
 
 ### Constants
 
@@ -85,20 +138,55 @@ the pre-shared key and the password.
 | `DEFAULT_MTU` | `1400` |
 | `MIN_MTU` / `MAX_MTU` | `576` / `1500` |
 | `DEFAULT_PPP_AUTH` | `[MSCHAP_V2, CHAP_MD5, PAP]` |
+| `newId()` | a fresh random UUID |
+| `blank(name)` | an empty profile with a fresh id, for the "add a connection" flow |
+
+## The two secrets
+
+Both are addressed by `(profileId, SecretKind)`:
+
+| `SecretKind` | Store key | Required? |
+| --- | --- | --- |
+| `PRESHARED_KEY` | `secret.<id>.psk` | **yes** — validation and `VpnConfig` both refuse without it |
+| `PASSWORD` | `secret.<id>.password` | no — plenty of concentrators use an empty one |
+
+Neither is trimmed anywhere: leading and trailing spaces may be part of the value.
+
+### Editing one
+
+A secret field in the form is in exactly one of three states, driven by `SecretIntent`:
+
+| Intent | What the field shows | What saving does (`SecretCommit`) |
+| --- | --- | --- |
+| `KEEP` | the `••••••••` placeholder with **Replace** / **Clear** (or an empty editable field when nothing is stored) | `Keep` — the vault is not touched |
+| `REPLACE` | an editable password field with a reveal toggle and **Keep the saved one** | `Store` if something was typed, **`Keep` if not** |
+| `CLEAR` | "Will be removed when you save", with **Undo** | `Clear` |
+
+The row that matters is `REPLACE` with nothing typed: the user tapped **Replace**, changed their
+mind, and left the field empty. Treating that as "store an empty secret" — or worse as a clear —
+would silently destroy a working credential during an unrelated edit. It is a `Keep`.
+
+Clearing is always confirmed by a dialog, because it is unrecoverable.
+
+**Duplicating a profile copies no secrets.** They are filed under the original's id in a store the UI
+cannot read, so there is nothing to copy even in principle; the snackbar says so. **Deleting a
+profile wipes both of its secrets**, and the confirmation dialog says that too.
 
 ## Validation rules
 
-`VpnProfile.validate()` mirrors `VpnConfig`'s `require` blocks so the UI can put the message next to
-the offending field instead of letting the constructor throw. Messages are plain English rather than
-string resources, which is what keeps the class Android-free.
+`ProfileFormState.validate()` (in `ui/profile/`) mirrors `VpnConfig`'s `require` blocks so the UI can
+put the message next to the offending field instead of letting the constructor throw. Messages are
+plain English rather than string resources, which is what keeps the class Android-free and
+unit-testable.
 
 | Field | Rule | Message |
 | --- | --- | --- |
+| `NAME` | not blank | `A profile name is required` |
 | `SERVER` | not blank | `Server address is required` |
 | `SERVER` | no whitespace | `Server address cannot contain spaces` |
 | `SERVER` | matches a permissive host pattern (letters, digits, `.`, `_`, `-`, `:`, `[`, `]`) | `Not a valid host name or IP address` |
-| `PRESHARED_KEY` | not empty | `Pre-shared key is required` |
-| `MTU` | 576–1500 | `MTU must be between 576 and 1500` |
+| `PRESHARED_KEY` | a key will exist after saving | `A pre-shared key is required` |
+| `MTU` | the text parses to 576–1500 | `MTU must be between 576 and 1500` |
 | `IDENTITY_VALUE` | non-blank when the identity type is not `AUTO_IPV4` | `An identity value is required for <TYPE>` |
 | `DNS_SERVERS` | every entry is an IPv4 dotted quad or an IPv6 literal | `'<value>' is not an IP address` (first offender only) |
 | `PPP_AUTH` | at least one protocol | `At least one PPP authentication protocol must be allowed` |
@@ -106,22 +194,72 @@ string resources, which is what keeps the class Android-free.
 The three `SERVER` rules are mutually exclusive; the rest accumulate. The host pattern is
 deliberately permissive — the resolver has the final word.
 
-**`username` and `password` are not validated.** An empty one is accepted and the peer rejects it at
-PPP time, which produces a clearer error than a form that refuses to submit.
+**The pre-shared key rule is the one that is not a straight mirror.** It cannot read a value, because
+nothing in the UI can. It is checked through `SecretFieldModel.isSatisfied`, which is derived from
+the same `commit()` the writer uses — so the validator and the writer can never disagree about
+whether a secret is about to exist. A profile whose key was saved months ago validates without the UI
+ever seeing it, and a freshly typed key validates before the vault has seen it.
+
+**MTU is validated as text, not as a number.** The field keeps the user's characters while editing;
+parsing on every keystroke turned a half-deleted `14` into an error the user could not read past.
+`toProfile()` does the conversion once, on save.
+
+**`username` and the password are not validated.** An empty one is accepted and the peer rejects it
+at PPP time, which produces a clearer error than a form that refuses to submit.
+
+Errors are only drawn once the user has earned them: a field must have been touched, or a save must
+have been refused (`showAllErrors`), before its message appears.
+
+## How a profile becomes a VpnConfig
+
+`prepareConnect` in `service/ConnectPreparation.kt` is the **only** place in the app where a profile
+and its secrets are combined. It is a plain function over plain values, so its failure paths are
+testable without a device, a keystore or a service, and it runs on the tunnel worker thread — never
+on the main looper, and nowhere `ui/` can reach it.
+
+It decides *whether* to connect; the field-by-field mapping itself lives in `VpnProfile.toVpnConfig`,
+which it delegates to. There is deliberately only one copy of that mapping: an earlier version had
+two, they had already drifted apart, and the test that was supposed to catch a dropped field was
+pointed at the copy the app did not use.
+
+```
+active profile  ─┐
+psk  (CharArray) ─┼─► prepareConnect ─► Ready(VpnConfig) | Rejected(reason)
+password (CharArray) ┘
+```
+
+| Outcome | Reason |
+| --- | --- |
+| `Rejected` | `No VPN profile is selected. Create one and mark it active.` |
+| `Rejected` | `A pre-shared key is required` — deliberately the same words as the form's own message, so the user recognises it |
+| `Rejected` | whatever `VpnConfig`'s own `require` block said, if the profile was written by an older build or edited outside the app |
+| `Ready` | the assembled `VpnConfig` |
+
+A `null` password is treated as an empty one, which is what a peer that authenticates on the
+pre-shared key alone expects.
+
+The two `CharArray`s belong to the caller, which wipes them in a `finally` as soon as the config has
+been built. That is only a partial win — `VpnConfig` takes `String`s, so from that point the values
+are immutable heap objects for the life of the tunnel. See
+[security.md](security.md#the-recommendation-on-the-table-a-secret-value-class).
 
 ## VpnConfig — what the stack reads
 
 `VpnConfig`'s constructor enforces: `serverHost` not blank, `presharedKey` not empty, `mtu` in
-576–1500, `allowedPppAuth` not empty.
+576–1500, `allowedPppAuth` not empty. Those messages travel on an exception, which goes further than
+a log line, so they name the offending field and never quote a value.
+
+Its `toString()` is written out by hand and reduces both credentials to `<redacted>` / `<unset>` —
+**never a length**. See [security.md](security.md#redaction).
 
 ### Identity and credentials
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `serverHost` | `String` | — | Required. Resolved once at the start of the connect sequence. |
-| `presharedKey` | `String` | — | Required. UTF-8 encoded for the key schedule. |
+| `presharedKey` | `String` | — | Required. UTF-8 encoded for the key schedule. Never logged. |
 | `username` | `String` | — | PPP. |
-| `password` | `String` | — | PPP. |
+| `password` | `String` | — | PPP. Never logged. |
 | `localIdentity` | `IkeIdentity` | `IkeIdentity(AUTO_IPV4, "")` | See [Identity](#identity). |
 
 ### Proposals
@@ -167,7 +305,7 @@ PPP time, which produces a clearer error than a form that refuses to submit.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `debugLogging` | `Boolean` | `false` | **Currently unused inside `:core`** — the level is set on the Android logger instead. Kept because it belongs to the configuration conceptually. |
+| `debugLogging` | `Boolean` | `false` | **Currently unused inside `:core`** — the stack emits at every level and the injected `VpnLogger` decides what to keep. The Android service reads this flag and sets its sink's threshold. Kept on `VpnConfig` because it belongs to the configuration conceptually. |
 
 ## Phase1Proposal and Phase2Proposal
 
@@ -244,6 +382,8 @@ directly when driving the stack from a test.
 
 There is also no way to configure an **L2TP tunnel secret**, so a peer that sends a Challenge AVP in
 its SCCRP fails with a clear message. The protocol side is implemented; only the plumbing is missing.
+Note that a tunnel secret would be a *third* credential and belongs in `SecretVault` with the other
+two, not on `VpnProfile`.
 
 ## Constants that are not configurable
 
@@ -267,6 +407,7 @@ Compiled in, listed here so you do not go looking for a setting that does not ex
 | shutdown grace (`:core`) | 2 s | how long the socket outlives a stop so the teardown can leave |
 | maximum consecutive socket read failures | 16 | then the reader gives up rather than spinning |
 | IKE queue / L2TP queue depth | 32 / 256 datagrams | |
+| deferred ISAKMP queue depth | 16 datagrams | messages handed back during a phase-1 rekey; see [rekeying.md](rekeying.md#messages-for-the-superseded-sa-are-handed-back-not-dropped) |
 | ESP anti-replay window | 64 | packets |
 
 ### PPP
@@ -299,5 +440,14 @@ Compiled in, listed here so you do not go looking for a setting that does not ex
 | delay after a network handover | 1 s |
 | network-change debounce | 3 s |
 | socket close grace (service backstop) | 3 s |
-| worker join timeout on destroy | 3 s |
+| profile-store readiness timeout on the worker | 15 s |
 | in-app log ring buffer | 500 lines |
+
+### Persistence
+
+| Constant | Value |
+| --- | --- |
+| profile schema version | 2 |
+| encrypted preference file | `vpn-profile-encrypted` |
+| plaintext fallback / legacy file | `vpn-profile` |
+| migrated single-profile id | `legacy` |
