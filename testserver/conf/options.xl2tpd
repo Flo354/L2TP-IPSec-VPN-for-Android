@@ -47,8 +47,10 @@ noipx
 # you want to exercise that path (a real Livebox does send IPV6CP).
 noipv6
 
-mtu 1400
-mru 1400
+# Deliberately below the client's own header budget of 1400: a real Livebox advertises 1350, and
+# a client that ignores the peer's MRU only fails on full-size packets - ping works, TLS hangs.
+mtu 1350
+mru 1350
 
 lcp-echo-interval 30
 lcp-echo-failure 5

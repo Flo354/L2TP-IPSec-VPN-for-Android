@@ -104,6 +104,11 @@ class LiveServerE2eTest {
             val tun = provider.established!!
             assertEquals(info.assignedAddress, tun.params.address)
             assertTrue("DNS should have been pushed", tun.params.dnsServers.isNotEmpty())
+            // The lab advertises MRU 1350, below the 1400 the header budget alone would allow.
+            // Handing the TUN anything larger is the classic "ping works, TLS hangs" bug.
+            assertEquals("the TUN MTU must respect the peer's MRU", 1350, tun.params.mtu)
+            assertEquals(info.mtu, tun.params.mtu)
+            assertEquals("DNS servers must be de-duplicated", tun.params.dnsServers.distinct(), tun.params.dnsServers)
 
             // Ping the LNS through the whole stack: TUN -> PPP -> L2TP -> UDP -> ESP -> UDP/4500.
             val payload = "arcan-l2tp-probe".toByteArray()

@@ -268,12 +268,22 @@ class L2tpIpsecTunnel(
         val pppResult = negotiatePpp(l2tp, ppp)
         log.i("PPP up: ${pppResult.localAddress} peer ${pppResult.remoteAddress} dns=${pppResult.dnsServers}")
 
-        val dns = config.dnsOverride.ifEmpty { pppResult.dnsServers }
+        // The header budget is only half the story: the peer also tells us, in LCP, the largest
+        // frame it is willing to receive. Handing the TUN anything above that is the classic
+        // "ping works but TLS hangs" failure, because only the full-size packets get dropped.
+        val effectiveMtu = minOf(tunnelMtu, pppResult.mru)
+        if (effectiveMtu != tunnelMtu) {
+            log.i("lowering the tunnel MTU from $tunnelMtu to $effectiveMtu; the peer asked for MRU ${pppResult.mru}")
+        }
+
+        // A peer that pushes the same resolver twice (Livebox does) would otherwise be installed
+        // twice on the system.
+        val dns = config.dnsOverride.ifEmpty { pppResult.dnsServers }.distinct()
         val device = tunProvider.establish(
             TunParameters(
                 address = pppResult.localAddress,
                 prefixLength = 32,
-                mtu = tunnelMtu,
+                mtu = effectiveMtu,
                 dnsServers = dns,
                 blockIpv6 = config.blockIpv6,
             ),
@@ -288,7 +298,7 @@ class L2tpIpsecTunnel(
                 assignedAddress = pppResult.localAddress,
                 peerAddress = pppResult.remoteAddress,
                 dnsServers = dns,
-                mtu = tunnelMtu,
+                mtu = effectiveMtu,
                 natDetected = phase1.localBehindNat || phase1.remoteBehindNat,
                 udpEncapsulated = firstPhase2.udpEncapsulated,
                 phase1Description = "${config.phase1.encryption}/${config.phase1.hash}/${config.phase1.dhGroup}",
@@ -298,7 +308,7 @@ class L2tpIpsecTunnel(
             ),
         )
 
-        startUplinkThread(l2tp, device, tunnelMtu)
+        startUplinkThread(l2tp, device, effectiveMtu)
         startMaintenanceThread()
         pumpDownlink(l2tp, ppp, device)
     }

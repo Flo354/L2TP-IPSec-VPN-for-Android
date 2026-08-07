@@ -6,8 +6,12 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
@@ -70,6 +74,7 @@ class L2tpVpnService : VpnService() {
     private var connectivityManager: ConnectivityManager? = null
     private var registeredCallback: ConnectivityManager.NetworkCallback? = null
     private var currentNetwork: Network? = null
+    @Volatile private var lastNetworkChangeMs = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -161,13 +166,24 @@ class L2tpVpnService : VpnService() {
 
     /**
      * Unblocks the tunnel thread. `stop()` alone only flips a flag inside the stack, so we also
-     * tear down everything it could be blocked on: the protected sockets and the TUN descriptor.
+     * close the TUN descriptor, which is the one read no timeout will ever interrupt.
+     *
+     * The sockets are deliberately left alone for a moment. The stack still has to push its PPP
+     * Terminate, L2TP CDN/StopCCN and ISAKMP deletes through them, and a router that never sees
+     * those keeps the old session open — a Livebox then ignores the next SCCRQ entirely and the
+     * reconnect hangs. The tunnel closes them itself once the teardown is out; the reaper below is
+     * only the backstop for a thread that never gets that far.
      */
     private fun interruptTunnel() {
         runCatching { tunnel?.stop() }
-        runCatching { socketFactory?.closeAll() }
         closeTunDescriptor()
         synchronized(wakeUp) { wakeUp.notifyAll() }
+
+        val factory = socketFactory
+        Thread({
+            runCatching { Thread.sleep(SOCKET_CLOSE_GRACE_MS) }
+            runCatching { factory?.closeAll() }
+        }, "vpn-socket-reaper").apply { isDaemon = true }.start()
     }
 
     private fun shutdown() {
@@ -367,12 +383,27 @@ class L2tpVpnService : VpnService() {
 
     // ---------------------------------------------------------------- connectivity
 
+    /**
+     * Watches the network *underneath* the tunnel.
+     *
+     * It must never watch the default network, because once the VPN is up the default network for
+     * our own uid is the VPN: registering tun0 would look exactly like a handover, we would tear
+     * down the tunnel we had just finished building, and the rebuild would do it again. That is an
+     * infinite reconnect loop, and it is what "connects and disconnects instantly" looks like.
+     */
     private fun registerNetworkCallback() {
         val manager = connectivityManager ?: return
         if (registeredCallback != null) return
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                // Belt and braces: the request below already excludes VPNs, but the pre-31
+                // fallback watches the default network and would otherwise see our own tun0.
+                val capabilities = manager.getNetworkCapabilities(network)
+                if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+                    log.d { "Ignoring our own VPN network $network" }
+                    return
+                }
                 val previous = currentNetwork
                 currentNetwork = network
                 if (previous != null && previous != network) {
@@ -384,9 +415,28 @@ class L2tpVpnService : VpnService() {
                 if (currentNetwork == network) currentNetwork = null
             }
         }
-        runCatching { manager.registerDefaultNetworkCallback(callback) }
+
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                // Reports only the single best match, so it is the underlying default network
+                // with VPNs filtered out — exactly what the tunnel is built on.
+                manager.registerBestMatchingNetworkCallback(
+                    request, callback, Handler(Looper.getMainLooper()),
+                )
+            } else {
+                // Older platforms have no best-match callback. Watching every matching network
+                // would fire whenever a second one merely becomes available, so fall back to the
+                // default network and rely on the VPN filter above. A handover that happens while
+                // the tunnel is up may be missed; the L2TP keepalive notices it soon enough.
+                manager.registerDefaultNetworkCallback(callback)
+            }
+        }
             .onSuccess { registeredCallback = callback }
-            .onFailure { log.w("Could not register the default-network callback", it) }
+            .onFailure { log.w("Could not register the network callback", it) }
     }
 
     private fun unregisterNetworkCallback() {
@@ -405,6 +455,15 @@ class L2tpVpnService : VpnService() {
      */
     private fun onDefaultNetworkChanged(reason: String) {
         if (!running.get() || stopRequested) return
+        // A handover resets the backoff, so anything that fires this repeatedly turns into a tight
+        // reconnect loop. Rate-limiting it keeps a future mistake here merely slow instead of
+        // fatal, and real handovers never arrive this fast.
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastNetworkChangeMs < NETWORK_CHANGE_DEBOUNCE_MS) {
+            log.d { "Ignoring a network change ${now - lastNetworkChangeMs} ms after the last one" }
+            return
+        }
+        lastNetworkChangeMs = now
         log.i("$reason; rebuilding the tunnel")
         networkChangePending = true
         VpnStatusRepository.onState(TunnelState.RECONNECTING, reason)
@@ -489,6 +548,15 @@ class L2tpVpnService : VpnService() {
 
         /** A handover needs a moment for the new interface to get an address. */
         private const val NETWORK_CHANGE_DELAY_MS = 1_000L
+
+        /** Two handovers cannot legitimately land this close together. */
+        private const val NETWORK_CHANGE_DEBOUNCE_MS = 3_000L
+
+        /**
+         * How long the sockets outlive a stop request so the polite teardown can leave. Must be
+         * longer than the tunnel's own grace period, since this is only the backstop.
+         */
+        private const val SOCKET_CLOSE_GRACE_MS = 3_000L
 
         const val ACTION_CONNECT = "com.arcansecurity.vpn.l2tpipsec.action.CONNECT"
         const val ACTION_DISCONNECT = "com.arcansecurity.vpn.l2tpipsec.action.DISCONNECT"
