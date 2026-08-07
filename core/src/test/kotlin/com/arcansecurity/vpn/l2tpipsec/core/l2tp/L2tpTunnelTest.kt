@@ -159,7 +159,7 @@ internal class FakeLns(
 
     fun zlb(): ByteArray = L2tpCodec.encodeControl(clientTunnelId, 0, ns, nr, emptyList())
 
-    fun hello(): ByteArray = emit(L2tpMessageType.HELLO, emptyList())
+    fun hello(avps: List<L2tpAvp> = emptyList()): ByteArray = emit(L2tpMessageType.HELLO, avps)
 
     fun stopCcn(result: Int, error: Int = 0, message: String = ""): ByteArray = emit(
         L2tpMessageType.StopCCN,
@@ -271,11 +271,12 @@ class L2tpTunnelTest {
         retransmitTimeoutMs: Int = 100,
         maxRetransmits: Int = 3,
         helloIntervalMs: Int = 5_000,
+        logger: VpnLogger = VpnLogger.NONE,
     ) = L2tpTunnel(
         transport = lns,
         hostName = "android",
         clock = clock,
-        logger = VpnLogger.NONE,
+        logger = logger,
         tunnelSecret = secret,
         retransmitTimeoutMs = retransmitTimeoutMs,
         maxRetransmits = maxRetransmits,
@@ -588,6 +589,43 @@ class L2tpTunnelTest {
         assertEquals(L2tpTunnel.Received.Handled, tunnel.onPacket(lns.hello()))
         assertTrue(lns.last().isZlb)
         assertEquals(3, lns.last().header.nr)
+    }
+
+    @Test
+    fun `an acknowledgement ahead of what we sent does not empty the retransmit queue`() {
+        val lns = FakeLns(clock)
+        val tunnel = tunnel(lns, retransmitTimeoutMs = 100, maxRetransmits = 3)
+        tunnel.connect(timeoutMs = 10_000)
+        // The ICCN is the one message this LNS never acknowledges.
+        assertEquals(1, lns.count(L2tpMessageType.ICCN))
+
+        // Nr can never exceed the peer's view of our Ns; anything beyond it acknowledges messages
+        // we have not sent yet and must not retire the ones we have.
+        tunnel.onPacket(L2tpCodec.encodeControl(lns.clientTunnelId, 0, lns.ns, 9, emptyList()))
+
+        clock.advance(100)
+        tunnel.tick()
+        assertEquals("the ICCN must still be retransmitted", 2, lns.count(L2tpMessageType.ICCN))
+    }
+
+    @Test
+    fun `an unknown mandatory avp is logged instead of tearing the tunnel down`() {
+        val warnings = mutableListOf<String>()
+        val lns = FakeLns(clock)
+        val tunnel = tunnel(lns, logger = { _, _, message, _ -> warnings += message })
+        tunnel.connect(timeoutMs = 10_000)
+
+        // RFC 2661 section 4.2 says to terminate; Liveboxes emit mandatory AVPs that are not in the
+        // RFC, and losing the tunnel over one would be worse than ignoring it.
+        val outcome = tunnel.onPacket(
+            lns.hello(listOf(L2tpAvp(mandatory = true, hidden = false, vendorId = 0, type = 200, value = ByteArray(0)))),
+        )
+
+        assertEquals(L2tpTunnel.Received.Handled, outcome)
+        assertTrue(
+            "an unknown mandatory AVP must leave a trace: $warnings",
+            warnings.any { it.contains("mandatory") && it.contains("200") },
+        )
     }
 
     @Test

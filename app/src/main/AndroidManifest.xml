@@ -1,13 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- Android 14 requires a typed foreground service; there is no VPN type, so specialUse it is. -->
+    <!--
+        Android 14 refuses startForeground() unless the <service> declares a type, and even at
+        compileSdk 37 android.content.pm.ServiceInfo still has no FOREGROUND_SERVICE_TYPE_VPN.
+        specialUse is therefore the only applicable type, and it costs an extra permission plus the
+        PROPERTY_SPECIAL_USE_FGS_SUBTYPE justification declared on the service below.
+    -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+        allowBackup="false" is the whole story on API 26-30: it clears FLAG_ALLOW_BACKUP, so the
+        backup manager skips the app entirely and android:fullBackupContent is never consulted.
+        That is why the DataExtractionRules warning ("you should also set fullBackupContent") is
+        suppressed here rather than answered with a second rules file that could never run.
+
+        From Android 12 the same attribute only covers *cloud* backup; device-to-device transfer is
+        governed solely by dataExtractionRules, so @xml/data_extraction_rules is what actually stops
+        the pre-shared key and the PPP password from being copied onto a new handset.
+    -->
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -15,7 +31,8 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.L2tpVpn">
+        android:theme="@style/Theme.L2tpVpn"
+        tools:ignore="DataExtractionRules">
 
         <activity
             android:name=".ui.MainActivity"
@@ -31,8 +48,16 @@
         </activity>
 
         <!--
-            Exported so the platform can bind it for always-on VPN, and gated behind
-            BIND_VPN_SERVICE, which only the system holds - no third-party app can reach it.
+            Exported so the platform can reach it, and gated behind BIND_VPN_SERVICE, which only the
+            system holds - no third-party app can bind or start it. The android.net.VpnService
+            action is what the system starts for always-on VPN; L2tpVpnService treats it as a
+            connect request.
+
+            Google Play's VpnService policy ("apps with core VPN functionality or those falling
+            under specific exceptions") is informational here and needs no code: this app has no
+            purpose other than the VPN, which is the core-functionality case the policy allows. It
+            is not a lint check either - :app:lintDebug raises nothing for it - so there is nothing
+            to suppress, only a Play Console declaration to keep truthful.
         -->
         <service
             android:name=".service.L2tpVpnService"
@@ -43,9 +68,17 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
 
+            <!--
+                The justification Android 14 asks for in exchange for specialUse. Spelled out here
+                rather than kept behind @string/... : a resource reference survives the merge as an
+                unresolved id, and this value exists to be read straight off the manifest by Google
+                Play's tooling and by whoever reviews the app. It has to say what the service does,
+                why it must keep running, and why no other type fits - the same words belong in the
+                Play Console declaration.
+            -->
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="@string/fgs_special_use_subtype" />
+                android:value="Maintains a user-initiated L2TP/IPsec VPN tunnel: the service owns the IKE, ESP and PPP sockets and the TUN interface, and must keep running for as long as the VPN is up, including while the screen is off. No other foreground service type applies because the platform defines none for VpnService." />
         </service>
     </application>
 

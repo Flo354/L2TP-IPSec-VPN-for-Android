@@ -19,7 +19,13 @@ class SaAttribute private constructor(
     val value: ByteArray,
 ) {
 
-    /** The value read as a big-endian unsigned integer; only defined for values of 1..4 bytes. */
+    /**
+     * The big-endian value as a raw 32-bit pattern; only defined for values of 1..4 bytes.
+     *
+     * A four-byte value is *not* widened, so anything from 2^31 up reads back negative. Callers
+     * that compare against a small constant are unaffected, but a caller reading a magnitude — an
+     * SA life duration, say — has to treat a non-positive result as unusable.
+     */
     val intValue: Int
         get() {
             if (value.isEmpty() || value.size > 4) {

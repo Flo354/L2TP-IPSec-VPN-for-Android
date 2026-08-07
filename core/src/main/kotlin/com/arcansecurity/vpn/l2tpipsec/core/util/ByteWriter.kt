@@ -11,11 +11,21 @@ class ByteWriter(initialCapacity: Int = 128) {
 
     val size: Int get() = len
 
+    /**
+     * Makes room for [extra] more bytes, doubling the capacity as needed.
+     *
+     * The requirement is computed in [Long]: `len + extra` can overflow an `Int`, and the doubling
+     * used to wrap past 2^31 to a negative capacity and then to zero, at which point the loop never
+     * terminated.
+     */
     private fun ensure(extra: Int) {
-        if (len + extra <= buf.size) return
-        var cap = buf.size
-        while (cap < len + extra) cap = cap shl 1
-        buf = buf.copyOf(cap)
+        require(extra >= 0) { "negative length $extra" }
+        val needed = len.toLong() + extra
+        require(needed <= MAX_CAPACITY) { "ByteWriter cannot grow to $needed bytes" }
+        if (needed <= buf.size) return
+        var cap = buf.size.toLong()
+        while (cap < needed) cap = cap shl 1
+        buf = buf.copyOf(cap.coerceAtMost(MAX_CAPACITY).toInt())
     }
 
     fun u8(v: Int) = apply {
@@ -87,8 +97,14 @@ class ByteWriter(initialCapacity: Int = 128) {
     }
 
     private fun checkPatch(offset: Int, n: Int) {
-        require(offset >= 0 && offset + n <= len) { "patch out of range at $offset" }
+        // Written as a subtraction so a huge offset cannot wrap the comparison into a pass.
+        require(offset >= 0 && offset <= len - n) { "patch out of range at $offset" }
     }
 
     fun toByteArray(): ByteArray = buf.copyOf(len)
+
+    private companion object {
+        /** Largest array most JVMs will hand out; the header words are reserved by the runtime. */
+        const val MAX_CAPACITY = Int.MAX_VALUE - 8L
+    }
 }

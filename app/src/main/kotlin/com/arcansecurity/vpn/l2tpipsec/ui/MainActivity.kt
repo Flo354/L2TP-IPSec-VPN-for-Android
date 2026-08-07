@@ -49,9 +49,12 @@ class MainActivity : ComponentActivity() {
         ) { granted ->
             if (!granted) {
                 controller.showMessage(
-                    "Without the notification permission the tunnel may be stopped in the background",
+                    "Without the notification permission you will not see the tunnel's status",
                 )
             }
+            // Either way the connect carries on: POST_NOTIFICATIONS only decides whether the
+            // ongoing notification is visible, not whether the foreground service may run.
+            requestConsentAndStart()
         }
 
         setContent {
@@ -71,10 +74,22 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
+    /**
+     * The two system dialogs are chained rather than launched together: firing both in the same
+     * frame stacks the VPN consent on top of the permission prompt, and whichever the user answers
+     * first silently answers for the other.
+     */
     private fun requestConnect() {
         if (!controller.prepareForConnect()) return
-        requestNotificationPermissionIfNeeded()
+        if (requestNotificationPermission()) return // its callback resumes the connect
+        requestConsentAndStart()
+    }
 
+    private fun requestDisconnect() {
+        L2tpVpnService.disconnect(this)
+    }
+
+    private fun requestConsentAndStart() {
         val consent = VpnService.prepare(this)
         if (consent != null) {
             vpnConsentLauncher.launch(consent)
@@ -83,18 +98,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestDisconnect() {
-        L2tpVpnService.disconnect(this)
-    }
-
     private fun startTunnel() = L2tpVpnService.connect(this)
 
-    private fun requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    /** @return `true` when a prompt was shown and the connect has to wait for its result. */
+    private fun requestNotificationPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
         val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
-        if (!granted) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
+        if (granted) return false
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        return true
     }
 }

@@ -11,7 +11,7 @@ import com.arcansecurity.vpn.l2tpipsec.core.util.ProtocolException
  *
  * Only the fixed 20-byte part is modelled. Options are parsed over but not retained, and [encode]
  * always emits `ihl = 5`; the tunnel never needs to forward options, and dropping them keeps the
- * encoder allocation-free in the fast path.
+ * encoded header a fixed 20 bytes.
  *
  * The ECN bits of the traffic-class byte are likewise not modelled: [dscp] is the upper 6 bits and
  * [encode] writes the ECN bits back as zero.
@@ -120,6 +120,7 @@ data class Ipv4Header(
             val ihl = versionIhl and 0x0F
             if (version != 4) throw ProtocolException("not an IPv4 packet: version $version")
             if (ihl < 5) throw ProtocolException("IPv4 IHL $ihl is below the 5-word minimum")
+            // ihl is 4 bits, so ihl * 4 is at most 60 and the comparison cannot overflow.
             if (data.size - offset < ihl * 4) {
                 throw ProtocolException("truncated IPv4 header: ${data.size - offset} < ${ihl * 4}")
             }
@@ -157,7 +158,9 @@ data class Ipv4Header(
          * too short to be a header of the version its first nibble claims.
          */
         fun ipVersion(data: ByteArray, offset: Int, length: Int): Int {
-            if (offset < 0 || length <= 0 || offset + length > data.size) return -1
+            // A subtraction, not a sum: `offset + length` can overflow and wrap the check into a
+            // pass, which would report a version for bytes that are not in the buffer.
+            if (offset < 0 || length <= 0 || length > data.size - offset) return -1
             return when ((data[offset].toInt() ushr 4) and 0x0F) {
                 4 -> if (length >= MIN_HEADER_SIZE) 4 else -1
                 6 -> if (length >= IPV6_HEADER_SIZE) 6 else -1

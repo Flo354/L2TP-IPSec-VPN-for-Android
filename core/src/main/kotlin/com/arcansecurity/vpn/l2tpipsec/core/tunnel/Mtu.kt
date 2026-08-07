@@ -35,10 +35,20 @@ object Mtu {
     /** Conservative path MTU when the platform will not tell us the real one. */
     const val DEFAULT_PATH_MTU = 1500
 
+    /** Smallest MTU worth handing the TUN: the IPv4 minimum reassembly buffer of RFC 791. */
+    const val MINIMUM_MTU = 576
+
     /** Bytes available for the ESP packet itself, given a physical path MTU. */
     fun espBudget(pathMtu: Int): Int = pathMtu - IPV4_HEADER - UDP_HEADER
 
-    /** Largest ESP plaintext that still fits in [espBudget] bytes on the wire. */
+    /**
+     * Largest ESP plaintext that still fits in [espBudget] bytes on the wire.
+     *
+     * This is the same quantity as `EspOutboundSa.maxPayloadFor`, arrived at independently: the
+     * budget has to be computed before any SA exists, and an SA cannot be built without key
+     * material. `MtuTest` pins the two together across every cipher and integrity algorithm, so a
+     * change to either side breaks the build rather than the full-size packets.
+     */
     fun maxEspPayload(espBudget: Int, encryption: EspEncryption, integrity: EspIntegrity): Int {
         val block = encryption.blockBytes
         val fixed = 4 + 4 + block + integrity.icvBytes // SPI, sequence, IV, ICV
@@ -49,7 +59,12 @@ object Mtu {
 
     /**
      * The MTU to give the TUN interface: the largest IP packet that survives the whole stack,
-     * clamped by the user's configured ceiling.
+     * clamped by the user's configured ceiling and floored at [MINIMUM_MTU].
+     *
+     * The floor is deliberate. A path so small that the headers do not leave 576 bytes is one no
+     * IPv4 host is required to cope with anyway, and offering the system a smaller MTU than that
+     * makes it refuse the interface outright — a tunnel that fragments is still better than one
+     * that will not come up.
      */
     fun tunnelMtu(
         pathMtu: Int,
@@ -59,6 +74,6 @@ object Mtu {
     ): Int {
         val payload = maxEspPayload(espBudget(pathMtu), encryption, integrity)
         val computed = payload - INNER_UDP_HEADER - L2TP_DATA_HEADER - PPP_HEADER
-        return minOf(computed, configuredCeiling).coerceAtLeast(576)
+        return minOf(computed, configuredCeiling).coerceAtLeast(MINIMUM_MTU)
     }
 }

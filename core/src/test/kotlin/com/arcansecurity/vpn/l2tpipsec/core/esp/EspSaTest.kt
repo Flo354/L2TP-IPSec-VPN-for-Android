@@ -109,6 +109,29 @@ class EspSaTest {
         assertEquals(Ipv4Header.PROTO_TCP, result.nextHeader)
     }
 
+    /** `encapsulate(buffer, offset)` means "from [offset] to the end", like every range API here. */
+    @Test
+    fun encapsulateWithoutALengthTakesTheRestOfTheBuffer() {
+        val suite = suites[0]
+        val framed = Bytes.fromHex("deadbeef") + payload(50)
+        val result = suite.inbound().decapsulate(suite.outbound().encapsulate(framed, 4))
+        assertArrayEquals(payload(50), result.payload)
+    }
+
+    /** The next-header field is one byte on the wire, so a wider value must not be truncated. */
+    @Test
+    fun rejectsANextHeaderThatDoesNotFitInAByte() {
+        val suite = suites[0]
+        for (bad in listOf(-1, 256, 0x1FF)) {
+            try {
+                suite.outbound().encapsulate(payload(8), nextHeader = bad)
+                fail("expected IllegalArgumentException for next header $bad")
+            } catch (expected: IllegalArgumentException) {
+                // ok
+            }
+        }
+    }
+
     @Test
     fun decapsulatesFromAnOffsetInsideALargerBuffer() {
         val suite = suites[0]
@@ -164,6 +187,24 @@ class EspSaTest {
                 suite.inbound().decapsulate(packet + ByteArray(block))
             }
             expectEspException("$suite empty") { suite.inbound().decapsulate(ByteArray(0)) }
+        }
+    }
+
+    /**
+     * A slice whose end does not fit in an `Int` must be caught by the range check itself, not by
+     * an arithmetic accident further down the receive path.
+     */
+    @Test
+    fun rejectsARangeWhoseEndOverflows() {
+        val suite = suites[0]
+        val packet = suite.outbound().encapsulate(payload(32))
+        for (length in listOf(Int.MAX_VALUE, Int.MAX_VALUE - 3, packet.size + 1)) {
+            try {
+                suite.inbound().decapsulate(packet, 1, length)
+                fail("expected EspException for length $length")
+            } catch (e: EspException) {
+                assertTrue("$length: ${e.message}", e.message!!.contains("outside"))
+            }
         }
     }
 
@@ -263,6 +304,28 @@ class EspSaTest {
             assertEquals(0x5A.toByte(), out[8]) // nothing written before the offset
             assertEquals(0x5A.toByte(), out[9 + written]) // nor after the packet
             assertArrayEquals(original, suite.inbound().decapsulate(out, 9, written).payload)
+        }
+    }
+
+    /**
+     * [EspOutboundSa.encapsulateInto] promises the output buffer may be the payload buffer, which
+     * only holds as long as nothing is written back before the plaintext has been read out - the
+     * ESP header, the IV and the ciphertext all land on top of where the payload was.
+     */
+    @Test
+    fun encapsulateIntoWrapsAPayloadAlreadyInTheOutputBuffer() {
+        val suite = suites[0]
+        val original = payload(200)
+        for (payloadOffset in listOf(0, 4, 8, 24, 33)) {
+            val buffer = ByteArray(suite.outbound().packetLength(original.size) + 64)
+            System.arraycopy(original, 0, buffer, payloadOffset, original.size)
+            val written = suite.outbound()
+                .encapsulateInto(buffer, 0, buffer, payloadOffset, original.size)
+            assertArrayEquals(
+                "payload at $payloadOffset",
+                original,
+                suite.inbound().decapsulate(buffer, 0, written).payload,
+            )
         }
     }
 

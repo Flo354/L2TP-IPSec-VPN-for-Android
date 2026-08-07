@@ -3,6 +3,7 @@ package com.arcansecurity.vpn.l2tpipsec.core.ppp
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.PppAuthProtocol
 import com.arcansecurity.vpn.l2tpipsec.core.util.ByteReader
 import com.arcansecurity.vpn.l2tpipsec.core.util.ByteWriter
+import com.arcansecurity.vpn.l2tpipsec.core.util.Bytes
 import com.arcansecurity.vpn.l2tpipsec.core.util.ProtocolException
 
 /** PAP packet codes (RFC 1334 section 2.2). */
@@ -108,14 +109,27 @@ internal fun msChapErrorDescription(code: Int): String = when (code) {
     else -> "error $code"
 }
 
-/** Extracts `E=<digits>` from an MS-CHAPv2 Failure message; -1 when the peer did not send one. */
+/** Digits of the `S=` field: an MS-CHAPv2 authenticator response is a 20-byte SHA-1 digest. */
+private const val AUTHENTICATOR_HEX_DIGITS = 40
+
+/** Widest `E=` value that still fits an [Int]; Windows RAS error numbers are three digits. */
+private const val MAX_ERROR_CODE_DIGITS = 9
+
+/**
+ * Extracts `E=<digits>` from an MS-CHAPv2 Failure message; -1 when the peer did not send a usable
+ * one. Only ASCII digits count: `Char.isDigit` is true for every Unicode decimal digit, and a
+ * message full of Arabic-Indic digits would otherwise be turned into a nonsense error number.
+ */
 internal fun parseMsChapErrorCode(message: String): Int {
     val at = message.indexOf("E=")
     if (at < 0) return -1
     var i = at + 2
     var value = 0
     var digits = 0
-    while (i < message.length && message[i].isDigit()) {
+    while (i < message.length && message[i] in '0'..'9') {
+        // A run long enough to overflow the accumulator would otherwise wrap onto a code that
+        // means something else entirely, and be reported to the user as that.
+        if (digits >= MAX_ERROR_CODE_DIGITS) return -1
         value = value * 10 + (message[i] - '0')
         digits++
         i++
@@ -123,10 +137,19 @@ internal fun parseMsChapErrorCode(message: String): Int {
     return if (digits == 0) -1 else value
 }
 
-/** Extracts the 40 hex digits of `S=...` from an MS-CHAPv2 Success message; null when malformed. */
-internal fun parseMsChapAuthenticatorResponse(message: String): String? {
+/**
+ * Decodes the `S=<40 hex digits>` authenticator response of an MS-CHAPv2 Success message, or null
+ * when the peer did not send a well-formed one.
+ *
+ * The hex is validated and decoded together on purpose. This runs on a message an unauthenticated
+ * peer controls, and PPP only unwinds cleanly from [ProtocolException]; letting a damaged `S=`
+ * reach a parser that throws [IllegalArgumentException] would take the whole tunnel down instead of
+ * failing authentication.
+ */
+internal fun parseMsChapAuthenticatorResponse(message: String): ByteArray? {
     val at = message.indexOf("S=")
-    if (at < 0 || at + 42 > message.length) return null
-    val hex = message.substring(at + 2, at + 42)
-    return if (hex.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) hex else null
+    if (at < 0 || at + 2 + AUTHENTICATOR_HEX_DIGITS > message.length) return null
+    val hex = message.substring(at + 2, at + 2 + AUTHENTICATOR_HEX_DIGITS)
+    if (!hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return null
+    return Bytes.fromHex(hex)
 }

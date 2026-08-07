@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -23,15 +24,16 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelInfo
@@ -108,20 +110,37 @@ fun StatusCard(
     }
 }
 
+/**
+ * The infinite transition is created only while the dot actually pulses. An idle one keeps
+ * scheduling a frame callback for as long as it is in the composition, so leaving it there would
+ * mean the app never goes idle — and never lets the display drop its refresh rate — for the whole
+ * time the tunnel is simply up.
+ */
 @Composable
 private fun StatusDot(color: Color, pulsing: Boolean) {
+    if (pulsing) PulsingDot(color) else Dot(color, Modifier)
+}
+
+@Composable
+private fun PulsingDot(color: Color) {
     val transition = rememberInfiniteTransition(label = "status-pulse")
-    val alpha by transition.animateFloat(
+    val alpha = transition.animateFloat(
         initialValue = 1f,
         targetValue = 0.25f,
         animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
         label = "status-pulse-alpha",
     )
+    // Read inside the graphicsLayer lambda so the animation only redraws; reading it in the body
+    // would recompose this composable on every frame.
+    Dot(color, Modifier.graphicsLayer { this.alpha = alpha.value })
+}
+
+@Composable
+private fun Dot(color: Color, modifier: Modifier) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .size(14.dp)
-            .alpha(if (pulsing) alpha else 1f)
-            .clip(RoundedCornerShape(50))
+            .clip(CircleShape)
             .background(color),
     )
 }
@@ -131,7 +150,9 @@ private fun Uptime(connectedSinceMs: Long, statsSinceMs: Long) {
     // The service's own wall-clock stamp is authoritative; the stack's is only a fallback.
     val since = if (connectedSinceMs > 0) connectedSinceMs else statsSinceMs
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    androidx.compose.runtime.LaunchedEffect(since) {
+    // Only this composable reads `now`, so the once-a-second tick recomposes the uptime line and
+    // nothing else on the card.
+    LaunchedEffect(since) {
         while (true) {
             now = System.currentTimeMillis()
             delay(1_000)

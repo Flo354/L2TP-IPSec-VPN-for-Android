@@ -62,6 +62,7 @@ fun VpnApp(
     val showAllErrors by controller.showAllErrors.collectAsState()
     val advancedExpanded by controller.advancedExpanded.collectAsState()
     val message by controller.message.collectAsState()
+    val profileWasUnreadable by controller.profileWasUnreadable.collectAsState()
 
     val state by controller.status.state.collectAsState()
     val detail by controller.status.detail.collectAsState()
@@ -127,6 +128,15 @@ fun VpnApp(
                 Warning(
                     "This device's keystore is unavailable, so the pre-shared key and password " +
                         "are stored unencrypted.",
+                )
+            }
+
+            if (profileWasUnreadable) {
+                Spacer(Modifier.height(12.dp))
+                Warning(
+                    "The saved profile could not be decrypted and has been cleared. This happens " +
+                        "when the device's master key is replaced, usually after a restore. " +
+                        "Please enter the settings again.",
                 )
             }
 

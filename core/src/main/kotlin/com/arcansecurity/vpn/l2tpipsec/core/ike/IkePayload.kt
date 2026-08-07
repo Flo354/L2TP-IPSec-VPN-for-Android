@@ -235,6 +235,18 @@ class DeletePayload(
             val protocolId = r.u8()
             val spiSize = r.u8()
             val count = r.u16()
+            // RFC 2408 section 3.15 gives every SPI a real width and puts all of them in the
+            // payload. Both halves have to be checked before anything is sized off the count: a
+            // twelve-byte payload announcing 65535 zero-width SPIs would otherwise have us build a
+            // list of 65535 empty arrays out of nothing.
+            if (spiSize == 0 && count > 0) {
+                throw ProtocolException("delete payload announces $count SPIs of zero width")
+            }
+            if (count * spiSize > r.remaining) {
+                throw ProtocolException(
+                    "delete payload announces $count SPIs of $spiSize bytes, ${r.remaining} present",
+                )
+            }
             val spis = ArrayList<ByteArray>(count)
             repeat(count) { spis += r.bytes(spiSize) }
             return DeletePayload(protocolId, spis, doi)

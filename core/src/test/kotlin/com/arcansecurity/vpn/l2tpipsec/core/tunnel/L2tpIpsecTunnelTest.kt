@@ -144,6 +144,22 @@ class L2tpIpsecTunnelTest {
     }
 
     @Test
+    fun `a socket that cannot be opened is reported as an unreachable network`() {
+        val recorder = Recorder()
+        val tunnel = L2tpIpsecTunnel(
+            config = config(connectTimeoutMs = 5_000),
+            socketFactory = { throw SocketException("Network is unreachable") },
+            tunProvider = { null },
+            listener = recorder,
+        )
+        Thread({ tunnel.run() }, "tunnel-no-network").apply { isDaemon = true }.start()
+        assertTrue(recorder.finished.await(15, TimeUnit.SECONDS))
+        assertEquals(TunnelErrorKind.NETWORK_UNREACHABLE, recorder.kind)
+        // The reason the tunnel went away has to survive the shutdown for anything that polls it.
+        assertEquals(TunnelState.FAILED, tunnel.state)
+    }
+
+    @Test
     fun `an unresolvable host fails fast as a dns error`() {
         val recorder = Recorder()
         val tunnel = L2tpIpsecTunnel(

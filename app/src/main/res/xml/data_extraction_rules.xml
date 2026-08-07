@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     The preferences hold an IKE pre-shared key and a PPP password. Neither cloud backup nor
-    device-to-device transfer may carry them off this handset, so every domain is excluded.
+    device-to-device transfer may carry them off this handset, so every domain is excluded from
+    both. An empty <cloud-backup>/<device-transfer> element would mean "take everything": the
+    exclusions have to be spelled out, including the device_* domains that cover direct-boot
+    (device-protected) storage, so that moving credentials there later cannot silently opt them
+    back in.
+
+    This only applies from Android 12; below it android:allowBackup="false" already disables every
+    form of backup. See the comment on <application> in AndroidManifest.xml.
 -->
 <data-extraction-rules>
     <cloud-backup>
@@ -10,6 +17,10 @@
         <exclude domain="database" />
         <exclude domain="sharedpref" />
         <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="root" />
@@ -17,5 +28,9 @@
         <exclude domain="database" />
         <exclude domain="sharedpref" />
         <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
     </device-transfer>
 </data-extraction-rules>

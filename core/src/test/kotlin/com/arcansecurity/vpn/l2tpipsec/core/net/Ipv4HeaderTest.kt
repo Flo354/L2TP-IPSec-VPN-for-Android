@@ -104,6 +104,9 @@ class Ipv4HeaderTest {
         assertEquals(-1, Ipv4Header.ipVersion(v4, 0, 19)) // claims v4 but is too short
         assertEquals(-1, Ipv4Header.ipVersion(v6, 0, 39)) // claims v6 but is too short
         assertEquals(-1, Ipv4Header.ipVersion(v4, 0, 100)) // length beyond the buffer
+        // Byte 6 of the fixture happens to be 0x40, so a length that wraps `offset + length` used
+        // to sail past the range check and report a v4 packet that is not in the buffer.
+        assertEquals(-1, Ipv4Header.ipVersion(v4, 6, Int.MAX_VALUE))
     }
 
     @Test

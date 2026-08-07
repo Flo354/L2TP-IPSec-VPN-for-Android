@@ -16,25 +16,34 @@ import kotlinx.coroutines.flow.StateFlow
 class AndroidLogger(
     /** The ring buffer backing [lines]; injectable so tests can pin the clock. */
     val buffer: LogRingBuffer = LogRingBuffer(),
+    /**
+     * Where a record goes besides the ring buffer. Injectable because `android.util.Log` throws
+     * "not mocked" in a plain JVM unit test, and the level filter below is worth testing without
+     * dragging in a device or Robolectric.
+     */
+    private val logcat: (LogLevel, String, String, Throwable?) -> Unit = ::printToLogcat,
 ) : VpnLogger {
 
-    /** Records below this level are dropped; raised to DEBUG by the profile's debug switch. */
+    /**
+     * Records below this level are dropped; raised to DEBUG by the profile's debug switch. A record
+     * is kept when its level is at or above this one.
+     */
     @Volatile
     var minLevel: LogLevel = LogLevel.INFO
 
     /** Live view of the ring buffer, oldest line first. */
     val lines: StateFlow<List<String>> get() = buffer.lines
 
+    /**
+     * Mirrors the filter in [log] so the stack can skip building a message this sink would only
+     * drop. It matters on the data path, which traces once per dropped packet.
+     */
+    override fun isEnabled(level: LogLevel): Boolean = level >= minLevel
+
     override fun log(level: LogLevel, tag: String, message: String, error: Throwable?) {
         if (level < minLevel) return
 
-        val logcatTag = "$TAG_PREFIX$tag".take(MAX_LOGCAT_TAG)
-        when (level) {
-            LogLevel.DEBUG -> Log.d(logcatTag, message, error)
-            LogLevel.INFO -> Log.i(logcatTag, message, error)
-            LogLevel.WARN -> Log.w(logcatTag, message, error)
-            LogLevel.ERROR -> Log.e(logcatTag, message, error)
-        }
+        logcat(level, "$TAG_PREFIX$tag".take(MAX_LOGCAT_TAG), message, error)
         buffer.append(level, tag, message, error)
     }
 
@@ -53,5 +62,14 @@ class AndroidLogger(
          * binding to each other, so a single shared sink is the simplest thing that works.
          */
         val shared: AndroidLogger by lazy { AndroidLogger() }
+    }
+}
+
+private fun printToLogcat(level: LogLevel, tag: String, message: String, error: Throwable?) {
+    when (level) {
+        LogLevel.DEBUG -> Log.d(tag, message, error)
+        LogLevel.INFO -> Log.i(tag, message, error)
+        LogLevel.WARN -> Log.w(tag, message, error)
+        LogLevel.ERROR -> Log.e(tag, message, error)
     }
 }

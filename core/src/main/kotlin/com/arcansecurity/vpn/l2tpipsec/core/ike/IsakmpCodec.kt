@@ -82,17 +82,25 @@ class PayloadChain(val block: ByteArray, val slices: List<PayloadSlice>) {
     fun indexOfType(payloadType: Int): Int = slices.indexOfFirst { it.type == payloadType }
 
     /** The exact bytes of the payload body at [index], as received. */
-    fun bodyAt(index: Int): ByteArray = slices[index].body
+    fun bodyAt(index: Int): ByteArray = sliceAt(index).body
 
     /**
      * The exact bytes of every payload after [index], generic headers included. Empty when [index]
      * is the last payload.
      */
     fun bytesAfter(index: Int): ByteArray {
-        val from = slices[index].end
+        val from = sliceAt(index).end
         val to = slices.last().end
         return if (to <= from) ByteArray(0) else block.copyOfRange(from, to)
     }
+
+    /**
+     * Indices here come from [indexOfType], which answers -1 for a payload the peer left out, and
+     * a chain decoded from a "next payload = none" header is empty. Both must surface as "the peer
+     * sent something we cannot use" rather than as an [IndexOutOfBoundsException] escaping a parser.
+     */
+    private fun sliceAt(index: Int): PayloadSlice = slices.getOrNull(index)
+        ?: throw ProtocolException("no payload at index $index in a chain of ${slices.size}")
 }
 
 /** Encoding and decoding of ISAKMP messages and payload chains. */

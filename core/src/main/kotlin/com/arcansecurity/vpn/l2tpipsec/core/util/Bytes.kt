@@ -18,7 +18,7 @@ object Bytes {
         return String(out)
     }
 
-    /** Parses hex, ignoring whitespace and ':' separators so RFC test vectors can be pasted as-is. */
+    /** Parses hex, ignoring whitespace, ':' and '-' so RFC test vectors can be pasted as-is. */
     fun fromHex(s: String): ByteArray {
         val clean = StringBuilder(s.length)
         for (c in s) if (!c.isWhitespace() && c != ':' && c != '-') clean.append(c)
@@ -83,10 +83,13 @@ object Bytes {
     /**
      * Left-pads with zeroes to [n] bytes. Diffie-Hellman public values and shared secrets must be
      * transmitted with the full modulus length even when the leading bytes happen to be zero.
+     *
+     * Always a fresh array, like [truncate]: the callers are key-derivation paths that go on to
+     * wipe or reuse what they get back, and handing [b] itself over when it already has the right
+     * length would make that reach into the caller's buffer.
      */
     fun leftPad(b: ByteArray, n: Int): ByteArray {
         require(b.size <= n) { "value of ${b.size} bytes is longer than target $n" }
-        if (b.size == n) return b
         val out = ByteArray(n)
         System.arraycopy(b, 0, out, n - b.size, b.size)
         return out

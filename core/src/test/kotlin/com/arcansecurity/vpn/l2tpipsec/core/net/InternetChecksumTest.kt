@@ -2,6 +2,7 @@ package com.arcansecurity.vpn.l2tpipsec.core.net
 
 import com.arcansecurity.vpn.l2tpipsec.core.util.Bytes
 import org.junit.Assert.assertEquals
+import org.junit.Assert.fail
 import org.junit.Test
 
 class InternetChecksumTest {
@@ -58,6 +59,34 @@ class InternetChecksumTest {
             0,
             InternetChecksum.computeWithPseudoHeader(src, dst, Ipv4Header.PROTO_UDP, datagram),
         )
+    }
+
+    /** `computeWithPseudoHeader(..., payload, offset)` covers the payload from [offset] to the end. */
+    @Test
+    fun pseudoHeaderChecksumWithoutALengthTakesTheRestOfTheBuffer() {
+        val src = Bytes.ipv4ToBytes("192.168.1.10")
+        val dst = Bytes.ipv4ToBytes("10.0.0.1")
+        val datagram = Bytes.fromHex("06a506a500125ebdc802000c000100000000")
+        val padded = Bytes.fromHex("aabbcc") + datagram
+        assertEquals(
+            InternetChecksum.computeWithPseudoHeader(src, dst, Ipv4Header.PROTO_UDP, datagram),
+            InternetChecksum.computeWithPseudoHeader(src, dst, Ipv4Header.PROTO_UDP, padded, 3),
+        )
+    }
+
+    /**
+     * A length whose end does not fit in an `Int` must be rejected: wrapping it used to make the
+     * sum loop exit immediately and return a plausible-looking checksum over nothing at all.
+     */
+    @Test
+    fun rejectsARangeWhoseEndOverflows() {
+        val data = Bytes.fromHex("0001f203f4f5f6f7")
+        try {
+            InternetChecksum.compute(data, 1, Int.MAX_VALUE)
+            fail("expected IllegalArgumentException")
+        } catch (expected: IllegalArgumentException) {
+            // ok
+        }
     }
 
     /** Independently computed with a reference implementation over the same pseudo-header. */

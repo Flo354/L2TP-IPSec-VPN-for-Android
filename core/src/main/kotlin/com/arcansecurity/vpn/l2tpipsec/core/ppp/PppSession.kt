@@ -44,6 +44,14 @@ class PppSession(
 
     enum class Phase { DEAD, ESTABLISH, AUTHENTICATE, NETWORK, OPEN, TERMINATE, FAILED }
 
+    init {
+        // A peer asking for something we do not allow is countered with our preferred protocol, so
+        // there has to be one. Failing here beats a NoSuchElementException out of the packet pump
+        // halfway through LCP.
+        require(allowedAuth.isNotEmpty()) { "at least one PPP authentication protocol is required" }
+        require(requestedMru >= MIN_MRU) { "requestedMru must be at least $MIN_MRU, got $requestedMru" }
+    }
+
     private val log = Log("ppp", logger)
 
     var phase: Phase = Phase.DEAD
@@ -67,6 +75,12 @@ class PppSession(
         var pendingPacket: ByteArray? = null
         var tries = 0
         var nextSendAtMs = 0L
+
+        /**
+         * Configure-Naks received since the peer last acknowledged one of our requests. RFC 1661
+         * section 4.6 calls the ceiling Max-Failure; past it the negotiation is not converging.
+         */
+        var naks = 0
 
         /** Our Configure-Request has been acknowledged. */
         var localOpen = false
@@ -111,6 +125,7 @@ class PppSession(
     // Authentication.
     private var negotiatedAuth: PppAuthProtocol? = null
     private var authProtocolUsed: PppAuthProtocol? = null
+    private var authSucceeded = false
     private var authDeadlineMs = 0L
     private var papPacket: ByteArray? = null
     private var papIdentifier = 0
@@ -119,6 +134,12 @@ class PppSession(
     private var msChapAuthenticatorChallenge: ByteArray? = null
     private var msChapPeerChallenge: ByteArray? = null
     private var msChapNtResponse: ByteArray? = null
+
+    // The CHAP Challenge we last answered, and the Response we answered it with, so that a
+    // retransmitted Challenge is answered identically. -1 matches no CHAP identifier.
+    private var answeredChallengeId = -1
+    private var answeredChallenge: ByteArray? = null
+    private var answeredResponse: ByteArray? = null
 
     // Keepalives and shutdown.
     private var echoesEnabled = true
@@ -150,8 +171,10 @@ class PppSession(
                 PppProtocol.PAP -> handlePap(PppControlPacket.parse(payload, offset, length))
                 PppProtocol.CHAP -> handleChap(PppControlPacket.parse(payload, offset, length))
                 PppProtocol.IPCP -> handleIpcp(PppControlPacket.parse(payload, offset, length))
+                // The tunnel routes IPv4 straight to the TUN once PPP is up, so a data frame only
+                // reaches the session before that, or for a family we never brought up.
                 PppProtocol.IPV4, PppProtocol.IPV6 ->
-                    log.d { "ignoring a data frame received during negotiation" }
+                    log.d { "ignoring a ${PppProtocol.name(protocol)} data frame in phase $phase" }
                 // RFC 1661 section 5.7: anything we do not implement gets a Protocol-Reject.
                 else -> sendProtocolReject(protocol, payload, offset, length)
             }
@@ -214,6 +237,7 @@ class PppSession(
 
             PppCode.CONFIGURE_ACK -> if (packet.identifier == lcp.pendingId) {
                 lcp.clearPending()
+                lcp.naks = 0
                 lcp.localOpen = true
                 checkLcpOpened()
             }
@@ -296,42 +320,68 @@ class PppSession(
     }
 
     private fun onLcpConfigureNak(packet: PppControlPacket) {
+        val treatAsReject = notConverging(lcp, "LCP")
+        var changed = false
         for (option in packet.options()) {
             when (option.type) {
-                LcpOption.MRU -> if (option.value.size == 2) {
-                    // Only ever shrink: our receive buffers are sized for requestedMru.
-                    localMru = readU16(option.value).coerceIn(MIN_MRU, requestedMru)
+                LcpOption.MRU -> if (treatAsReject) {
+                    changed = dropMru() || changed
+                } else if (option.value.size == 2) {
+                    // Never ask for more than we told the caller we could receive: the receive
+                    // buffers are sized for requestedMru. A peer that naks with a larger value
+                    // therefore gets the same number back, which is why Max-Failure matters here.
+                    val proposed = readU16(option.value).coerceAtMost(requestedMru).coerceAtLeast(MIN_MRU)
+                    if (proposed != localMru) {
+                        localMru = proposed
+                        changed = true
+                    }
                     log.d { "peer naked our MRU, using $localMru" }
                 }
 
-                LcpOption.MAGIC_NUMBER -> {
-                    magic = if (option.value.size == 4 && readI32(option.value) != 0) readI32(option.value) else randomMagic()
+                LcpOption.MAGIC_NUMBER -> if (treatAsReject) {
+                    changed = dropMagic() || changed
+                } else {
+                    // RFC 1661 section 6.4: the peer naks the Magic-Number when it collides with
+                    // its own, so the replacement has to be a fresh random value. Taking the number
+                    // the peer suggested risks landing on the peer's own, and its next
+                    // Configure-Request would then read as a looped-back line.
+                    magic = freshMagic(option.value)
+                    changed = true
                 }
 
                 else -> log.d { "ignoring LCP Configure-Nak for option ${option.type}" }
             }
         }
-        sendConfigureRequest(lcp, lcpOptions())
+        if (changed) sendConfigureRequest(lcp, lcpOptions()) else logStalledNegotiation("LCP", PppCode.CONFIGURE_NAK)
     }
 
     private fun onLcpConfigureReject(packet: PppControlPacket) {
+        var changed = false
         for (option in packet.options()) {
             when (option.type) {
-                LcpOption.MRU -> {
-                    wantMru = false
-                    localMru = DEFAULT_MRU
-                }
-
-                LcpOption.MAGIC_NUMBER -> {
-                    // Without a magic number there is no loopback detection, but the link still works.
-                    wantMagic = false
-                    magic = 0
-                }
-
+                LcpOption.MRU -> changed = dropMru() || changed
+                LcpOption.MAGIC_NUMBER -> changed = dropMagic() || changed
                 else -> log.d { "ignoring LCP Configure-Reject for option ${option.type}" }
             }
         }
-        sendConfigureRequest(lcp, lcpOptions())
+        if (changed) sendConfigureRequest(lcp, lcpOptions()) else logStalledNegotiation("LCP", PppCode.CONFIGURE_REJECT)
+    }
+
+    private fun dropMru(): Boolean {
+        if (!wantMru) return false
+        wantMru = false
+        localMru = DEFAULT_MRU
+        log.i("no longer asking for an MRU, falling back to the $DEFAULT_MRU-byte default")
+        return true
+    }
+
+    /** Without a magic number there is no loopback detection, but the link still works. */
+    private fun dropMagic(): Boolean {
+        if (!wantMagic) return false
+        wantMagic = false
+        magic = 0
+        log.i("no longer asking for a Magic-Number, loopback detection is off")
+        return true
     }
 
     private fun onLcpCodeReject(packet: PppControlPacket) {
@@ -390,8 +440,12 @@ class PppSession(
         echoOutstanding = 0
         log.i("LCP opened (peer mru=$peerMru, auth=${negotiatedAuth ?: "none"})")
         val auth = negotiatedAuth
-        if (auth == null) {
-            // RFC 1661 section 3.5: authentication is optional, go straight to the network phase.
+        if (auth == null || authSucceeded) {
+            // RFC 1661 section 3.5: authentication is optional. It can also already be over — the
+            // peer opens LCP as soon as it has acknowledged our request and we have acknowledged
+            // its own, so a lost Configure-Ack lets its whole CHAP exchange overtake ours. Entering
+            // the authentication phase then would wait out the auth timeout for a challenge the
+            // peer has no reason to send again.
             startNetworkPhase()
             return
         }
@@ -463,6 +517,13 @@ class PppSession(
     }
 
     private fun handleChap(packet: PppControlPacket) {
+        // A Success is what moves us out of the authentication phase, so it may only be honoured
+        // when a CHAP flavour is what we agreed to speak. Otherwise an LNS that asked for PAP could
+        // wave us through without ever seeing the password.
+        if (negotiatedAuth != PppAuthProtocol.CHAP_MD5 && negotiatedAuth != PppAuthProtocol.MSCHAP_V2) {
+            log.w("ignoring a CHAP packet: the negotiated authentication is ${negotiatedAuth ?: "none"}")
+            return
+        }
         when (packet.code) {
             ChapCode.CHALLENGE -> onChapChallenge(packet)
             ChapCode.SUCCESS -> onChapSuccess(packet)
@@ -472,21 +533,22 @@ class PppSession(
     }
 
     private fun onChapChallenge(packet: PppControlPacket) {
-        val challenge = ChapValue.parse(packet.data)
-        when (negotiatedAuth) {
-            PppAuthProtocol.CHAP_MD5 -> {
-                val response = ChapPacket.md5Response(packet.identifier, password, challenge.value)
-                log.i("answering CHAP-MD5 challenge from '${challenge.name}'")
-                send(
-                    PppProtocol.CHAP,
-                    PppControlPacket(
-                        ChapCode.RESPONSE,
-                        packet.identifier,
-                        ChapPacket.encode(response, username),
-                    ).encode(),
-                )
-            }
+        // RFC 1994 section 4.1: a retransmitted Challenge repeats both the identifier and the
+        // value, and has to be answered with the very same Response. Drawing a new MS-CHAPv2 peer
+        // challenge instead would change the NT-Response, and the Success the authenticator had
+        // already computed over the first one would then fail to verify — a correct password
+        // reported as "the server does not know the password".
+        val previous = answeredResponse
+        if (previous != null && packet.identifier == answeredChallengeId &&
+            packet.data.contentEquals(answeredChallenge)
+        ) {
+            log.d { "repeating the CHAP Response for challenge id=${packet.identifier}" }
+            send(PppProtocol.CHAP, previous)
+            return
+        }
 
+        val challenge = ChapValue.parse(packet.data)
+        val value = when (negotiatedAuth) {
             PppAuthProtocol.MSCHAP_V2 -> {
                 if (challenge.value.size != MsChapV2.CHALLENGE_SIZE) {
                     failAuth("MS-CHAPv2 challenge is ${challenge.value.size} bytes, expected ${MsChapV2.CHALLENGE_SIZE}")
@@ -498,26 +560,29 @@ class PppSession(
                 msChapAuthenticatorChallenge = challenge.value
                 msChapPeerChallenge = peerChallenge
                 msChapNtResponse = ntResponse
+                log.i("answering MS-CHAPv2 challenge from '${challenge.name}'")
                 // RFC 2759 section 4: peer challenge, 8 reserved zero bytes, NT-Response, flags.
-                val value = ByteWriter(MsChapV2.RESPONSE_SIZE)
+                ByteWriter(MsChapV2.RESPONSE_SIZE)
                     .bytes(peerChallenge)
                     .zeros(8)
                     .bytes(ntResponse)
                     .u8(0)
                     .toByteArray()
-                log.i("answering MS-CHAPv2 challenge from '${challenge.name}'")
-                send(
-                    PppProtocol.CHAP,
-                    PppControlPacket(
-                        ChapCode.RESPONSE,
-                        packet.identifier,
-                        ChapPacket.encode(value, username),
-                    ).encode(),
-                )
             }
 
-            else -> log.w("ignoring a CHAP challenge: CHAP was not negotiated")
+            // handleChap has already turned away everything that is not a CHAP flavour.
+            else -> {
+                log.i("answering CHAP-MD5 challenge from '${challenge.name}'")
+                ChapPacket.md5Response(packet.identifier, password, challenge.value)
+            }
         }
+
+        val response =
+            PppControlPacket(ChapCode.RESPONSE, packet.identifier, ChapPacket.encode(value, username)).encode()
+        answeredChallengeId = packet.identifier
+        answeredChallenge = packet.data
+        answeredResponse = response
+        send(PppProtocol.CHAP, response)
     }
 
     private fun onChapSuccess(packet: PppControlPacket) {
@@ -540,15 +605,19 @@ class PppSession(
             failAuth("received an MS-CHAPv2 Success without having answered a challenge")
             return false
         }
+        // Decoded rather than compared as text: the peer chooses the case of its hex digits, and it
+        // is also the one place a damaged Success could otherwise throw instead of failing.
         val received = parseMsChapAuthenticatorResponse(message)
         if (received == null) {
             failAuth("MS-CHAPv2 Success message has no valid S= authenticator response")
             return false
         }
-        val expected = MsChapV2.generateAuthenticatorResponse(
-            password, ntResponse, peerChallenge, challenge, username,
+        // Ours by construction: MsChapV2 emits "S=" followed by 40 upper-case hex digits.
+        val expected = Bytes.fromHex(
+            MsChapV2.generateAuthenticatorResponse(password, ntResponse, peerChallenge, challenge, username)
+                .removePrefix("S="),
         )
-        if (!Bytes.constantTimeEquals(Bytes.fromHex(received), Bytes.fromHex(expected.substring(2)))) {
+        if (!Bytes.constantTimeEquals(received, expected)) {
             failAuth("MS-CHAPv2 server authenticator response mismatch, the server does not know the password")
             return false
         }
@@ -569,10 +638,13 @@ class PppSession(
     }
 
     private fun onAuthenticated() {
-        if (phase != Phase.AUTHENTICATE) return
+        if (authSucceeded) return
+        authSucceeded = true
         authProtocolUsed = negotiatedAuth
         log.i("authenticated with $authProtocolUsed")
-        startNetworkPhase()
+        // A Success that overtook the peer's LCP Configure-Ack is recorded but cannot start the
+        // network phase yet; checkLcpOpened does it as soon as LCP is up.
+        if (phase == Phase.AUTHENTICATE) startNetworkPhase()
     }
 
     // ---------------------------------------------------------------- IPCP
@@ -596,6 +668,7 @@ class PppSession(
 
             PppCode.CONFIGURE_ACK -> if (packet.identifier == ipcp.pendingId) {
                 ipcp.clearPending()
+                ipcp.naks = 0
                 ipcp.localOpen = true
                 checkIpcpOpened()
             }
@@ -638,34 +711,69 @@ class PppSession(
     }
 
     private fun onIpcpConfigureNak(packet: PppControlPacket) {
+        val treatAsReject = notConverging(ipcp, "IPCP")
+        var changed = false
         for (option in packet.options()) {
             if (option.value.size != 4) continue
             when (option.type) {
-                IpcpOption.IP_ADDRESS -> localAddress = option.value.copyOf()
-                IpcpOption.PRIMARY_DNS -> primaryDns = option.value.copyOf()
-                IpcpOption.SECONDARY_DNS -> secondaryDns = option.value.copyOf()
+                IpcpOption.IP_ADDRESS -> if (treatAsReject) {
+                    // There is no negotiation left to have: without an address IPCP is pointless,
+                    // and saying so beats waiting out the negotiation deadline.
+                    fail(TunnelErrorKind.PPP_FAILED, "the peer keeps refusing every IPCP address we ask for")
+                    return
+                } else if (!localAddress.contentEquals(option.value)) {
+                    localAddress = option.value.copyOf()
+                    changed = true
+                }
+
+                IpcpOption.PRIMARY_DNS -> if (treatAsReject) {
+                    changed = dropDns(IpcpOption.PRIMARY_DNS) || changed
+                } else if (!primaryDns.contentEquals(option.value)) {
+                    primaryDns = option.value.copyOf()
+                    changed = true
+                }
+
+                IpcpOption.SECONDARY_DNS -> if (treatAsReject) {
+                    changed = dropDns(IpcpOption.SECONDARY_DNS) || changed
+                } else if (!secondaryDns.contentEquals(option.value)) {
+                    secondaryDns = option.value.copyOf()
+                    changed = true
+                }
+
                 else -> log.d { "ignoring IPCP Configure-Nak for option ${option.type}" }
             }
+        }
+        if (!changed) {
+            logStalledNegotiation("IPCP", PppCode.CONFIGURE_NAK)
+            return
         }
         log.i("IPCP Configure-Nak: address=${Bytes.ipv4ToString(localAddress)} dns=${dnsServers()}")
         sendConfigureRequest(ipcp, ipcpOptions())
     }
 
     private fun onIpcpConfigureReject(packet: PppControlPacket) {
+        var changed = false
         for (option in packet.options()) {
             when (option.type) {
                 IpcpOption.IP_ADDRESS -> {
                     fail(TunnelErrorKind.PPP_FAILED, "peer rejected the IPCP IP-Address option")
                     return
                 }
-                // RFC 1877 options are an extension; losing them only costs us the DNS servers.
-                IpcpOption.PRIMARY_DNS -> wantPrimaryDns = false
-                IpcpOption.SECONDARY_DNS -> wantSecondaryDns = false
+
+                IpcpOption.PRIMARY_DNS, IpcpOption.SECONDARY_DNS -> changed = dropDns(option.type) || changed
                 else -> log.d { "ignoring IPCP Configure-Reject for option ${option.type}" }
             }
         }
-        log.i("peer rejected the IPCP DNS options, continuing without them")
-        sendConfigureRequest(ipcp, ipcpOptions())
+        if (changed) sendConfigureRequest(ipcp, ipcpOptions()) else logStalledNegotiation("IPCP", PppCode.CONFIGURE_REJECT)
+    }
+
+    /** RFC 1877 options are an extension; losing them only costs us the DNS servers. */
+    private fun dropDns(option: Int): Boolean {
+        val primary = option == IpcpOption.PRIMARY_DNS
+        if (!(if (primary) wantPrimaryDns else wantSecondaryDns)) return false
+        if (primary) wantPrimaryDns = false else wantSecondaryDns = false
+        log.i("the peer has no ${if (primary) "primary" else "secondary"} DNS server for us, continuing without it")
+        return true
     }
 
     private fun checkIpcpOpened() {
@@ -730,6 +838,30 @@ class PppSession(
         n.remoteOpen = code == PppCode.CONFIGURE_ACK
         send(n.protocol, PppControlPacket.ofOptions(code, packet.identifier, options).encode())
         return n.remoteOpen
+    }
+
+    /**
+     * RFC 1661 section 4.6 Max-Failure. Every Configure-Nak restarts the request counter, so a peer
+     * that keeps naking an option we cannot satisfy — a Secondary-DNS it does not have, an MRU
+     * above the one we asked for — would ping-pong with us until the negotiation deadline. Past the
+     * limit the Nak is handled as if it had been a Configure-Reject, which drops the option and
+     * lets the rest of the negotiation finish.
+     *
+     * @return true once the exchange has stopped converging.
+     */
+    private fun notConverging(n: Negotiation, name: String): Boolean {
+        val exhausted = n.naks++ >= MAX_CONFIGURE_NAKS
+        if (exhausted) log.w("$name is not converging after ${n.naks} Configure-Naks, dropping the naked options")
+        return exhausted
+    }
+
+    /**
+     * A Configure-Nak or Configure-Reject that leaves our request untouched must not draw a new
+     * one: an identical request would only earn an identical answer. The restart timer still covers
+     * the case where the packet was simply lost.
+     */
+    private fun logStalledNegotiation(name: String, code: Int) {
+        log.d { "$name ${PppCode.name(code)} changed nothing; leaving the restart timer to retransmit" }
     }
 
     private fun sendConfigureRequest(n: Negotiation, options: List<PppOption>) {
@@ -806,9 +938,11 @@ class PppSession(
 
     private fun sendCodeReject(n: Negotiation, packet: PppControlPacket) {
         log.w("rejecting unknown ${PppProtocol.name(n.protocol)} code ${packet.code}")
-        // RFC 1661 section 5.6: the Rejected-Packet field is the offending packet, MRU permitting.
+        // RFC 1661 section 5.6: the Rejected-Packet field is the offending packet, truncated to the
+        // peer's MRU. Truncating to ours instead would let us emit a reject the peer discards,
+        // leaving it to retransmit the code we just told it we do not understand.
         val rejected = packet.encode()
-        val kept = rejected.size.coerceAtMost((localMru - PppControlPacket.HEADER_SIZE).coerceAtLeast(0))
+        val kept = rejected.size.coerceAtMost((peerMru - PppControlPacket.HEADER_SIZE).coerceAtLeast(0))
         send(
             n.protocol,
             PppControlPacket(PppCode.CODE_REJECT, n.nextId(), rejected.copyOf(kept)).encode(),
@@ -822,7 +956,8 @@ class PppSession(
             return
         }
         log.i("rejecting protocol ${PppProtocol.name(protocol)}")
-        val room = (localMru - PppControlPacket.HEADER_SIZE - 2).coerceAtLeast(0)
+        // As for Code-Reject, the Rejected-Information is bounded by what the peer can receive.
+        val room = (peerMru - PppControlPacket.HEADER_SIZE - 2).coerceAtLeast(0)
         val kept = length.coerceAtMost(room)
         val body = ByteWriter(2 + kept).u16(protocol).bytes(payload, offset, kept).toByteArray()
         send(PppProtocol.LCP, PppControlPacket(PppCode.PROTOCOL_REJECT, lcp.nextId(), body).encode())
@@ -838,6 +973,14 @@ class PppSession(
     }
 
     private fun randomMagic(): Int = ByteReader(Bytes.randomNonZero(4)).i32()
+
+    /** A new random magic number, guaranteed not to be the one the peer suggested. */
+    private fun freshMagic(suggested: ByteArray): Int {
+        val avoid = if (suggested.size == 4) readI32(suggested) else 0
+        var next = randomMagic()
+        while (next == avoid) next = randomMagic()
+        return next
+    }
 
     private fun u16Value(v: Int) = byteArrayOf((v ushr 8).toByte(), v.toByte())
 
@@ -855,11 +998,15 @@ class PppSession(
         /** RFC 1661 section 6.1 default MRU, also the value used when the option is rejected. */
         const val DEFAULT_MRU = 1500
 
-        private const val MIN_MRU = 128
+        /** Below this an MRU cannot hold a useful IP packet, and the option is not worth honouring. */
+        const val MIN_MRU = 128
 
         /** RFC 1661 "Restart timer". */
         private const val RESTART_TIMER_MS = 3_000L
         private const val MAX_CONFIGURE_REQUESTS = 10
+
+        /** RFC 1661 "Max-Failure", the point at which a Configure-Nak exchange has stopped converging. */
+        private const val MAX_CONFIGURE_NAKS = 5
         private const val MAX_TERMINATE_REQUESTS = 3
         private const val MAX_PAP_REQUESTS = 5
         private const val ECHO_INTERVAL_MS = 20_000L

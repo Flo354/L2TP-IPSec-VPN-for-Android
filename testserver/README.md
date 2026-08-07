@@ -78,7 +78,7 @@ to be behind a NAT — this makes the server behave identically either way.
 | LNS address | `10.10.10.1` |
 | Client pool | `10.10.10.100` – `10.10.10.199` |
 | DNS pushed | `10.10.10.1`, `8.8.8.8` |
-| MTU / MRU | 1400 / 1400 |
+| MTU / MRU | 1350 / 1350 (deliberately below the client's 1400 header budget, so the MRU clamp is exercised) |
 | Auth offered | CHAP-MD5 first; MS-CHAPv2 and PAP reachable with one LCP Configure-Nak |
 | Disabled | EAP, CCP/MPPE, VJ header compression, BSD/Deflate, PFC/ACFC |
 

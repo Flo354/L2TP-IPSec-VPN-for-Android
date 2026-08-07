@@ -80,17 +80,24 @@ class EspOutboundSa(
     fun encapsulate(
         payload: ByteArray,
         payloadOffset: Int = 0,
-        payloadLength: Int = payload.size,
+        payloadLength: Int = payload.size - payloadOffset,
         nextHeader: Int = Ipv4Header.PROTO_UDP,
     ): ByteArray {
+        // Checked here as well as in encapsulateInto: a negative length would otherwise blow up in
+        // the array allocation below, before the message that says what is actually wrong.
+        require(payloadLength >= 0) { "negative payload length $payloadLength" }
         val out = ByteArray(packetLength(payloadLength))
         encapsulateInto(out, 0, payload, payloadOffset, payloadLength, nextHeader)
         return out
     }
 
     /**
-     * Encodes straight into [out] at [outOffset] and returns the byte count; avoids an allocation
-     * per packet on the send path, where [out] is the reusable socket buffer.
+     * Encodes straight into [out] at [outOffset] and returns the byte count. For callers that own
+     * a big enough buffer - a reusable socket buffer, say - and want to skip the allocation
+     * [encapsulate] makes per packet.
+     *
+     * [out] may be the same array as [payload]: the plaintext is assembled in a scratch buffer
+     * before anything is written back.
      *
      * @throws EspException when the 32-bit sequence number space is used up; see [exhausted].
      */
@@ -103,13 +110,16 @@ class EspOutboundSa(
         nextHeader: Int = Ipv4Header.PROTO_UDP,
     ): Int {
         require(payloadLength >= 0) { "negative payload length $payloadLength" }
-        require(payloadOffset >= 0 && payloadOffset + payloadLength <= payload.size) {
-            "payload range $payloadOffset..${payloadOffset + payloadLength} outside ${payload.size} bytes"
+        require(nextHeader in 0..0xFF) { "next header $nextHeader does not fit in a byte" }
+        // Every range check here is a subtraction, never a sum: the sums can overflow an `Int` and
+        // a wrapped comparison would pass.
+        require(payloadOffset >= 0 && payloadLength <= payload.size - payloadOffset) {
+            "payload range of $payloadLength bytes at $payloadOffset outside ${payload.size} bytes"
         }
         val blockBytes = encryption.blockBytes
         val total = packetLength(payloadLength)
-        require(outOffset >= 0 && outOffset + total <= out.size) {
-            "output buffer too small: need ${outOffset + total}, have ${out.size - outOffset}"
+        require(outOffset >= 0 && total <= out.size - outOffset) {
+            "output buffer too small: need $total bytes at $outOffset, have ${out.size}"
         }
 
         val sequence = seq.incrementAndGet()
@@ -173,7 +183,11 @@ class EspOutboundSa(
     private fun spiHex(): String = "0x%08x".format(spi)
 
     companion object {
-        /** 16 packets of margin before the 2^32 wrap; anything left in flight still has a number. */
+        /**
+         * The SA reports itself [exhausted] once it reaches this number, reserving the top 16
+         * values of the space. Rekeying takes a round trip, and the 15 numbers still left after
+         * the flag goes up are what the packets already queued behind it get to use.
+         */
         const val REKEY_THRESHOLD = 0xFFFFFFF0L
     }
 }

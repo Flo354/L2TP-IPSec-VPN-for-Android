@@ -74,9 +74,14 @@ class AndroidUdpSocketFactory @JvmOverloads constructor(
      * the default network changes.
      */
     fun closeAll() {
-        val sockets = synchronized(openSockets) { openSockets.toList() }
+        // Snapshot and clear under one lock. Clearing afterwards would also drop a socket that
+        // open() added in between, and a socket we no longer track is a leaked file descriptor.
+        val sockets = synchronized(openSockets) {
+            val snapshot = openSockets.toList()
+            openSockets.clear()
+            snapshot
+        }
         sockets.forEach { runCatching { it.close() } }
-        openSockets.clear()
     }
 
     private fun resolveLocalAddress(): InetAddress {
@@ -97,8 +102,21 @@ class AndroidUdpSocketFactory @JvmOverloads constructor(
         return try {
             DatagramSocket().use { probe ->
                 // Protect it too: during a reconnect the old TUN may still be up, and an
-                // unprotected probe would learn the tunnel's address instead of the real one.
-                service.protect(probe)
+                // unprotected probe would resolve its route through tun0 and report the tunnel's
+                // own address.
+                //
+                // A refusal is handled differently from open(), and deliberately. open() must fail
+                // hard because its socket carries the IKE, ESP and L2TP traffic, and an unprotected
+                // one routes that back into the tunnel it is building. This socket sends nothing at
+                // all — a UDP connect() is purely local — so there is no loop to prevent; the only
+                // thing at risk is the answer. So we throw the answer away instead of the
+                // connection, and let resolveLocalAddress() fall through to its next source rather
+                // than hand the IKE identity and both NAT-D hashes an address off the wrong
+                // interface, which the peer rejects with nothing in the log to explain why.
+                if (!service.protect(probe)) {
+                    log.w("VpnService.protect() refused the route probe; discarding its answer")
+                    return null
+                }
                 probe.connect(InetSocketAddress(target, ROUTE_PROBE_PORT))
                 probe.localAddress?.takeUnless { it.isAnyLocalAddress || it.isLoopbackAddress }
             }
@@ -153,11 +171,13 @@ private class ProtectedUdpSocket(
     override fun receive(buffer: ByteArray, timeoutMs: Int): Datagram? {
         // Java reads a zero timeout as "block forever", which is never what the caller means.
         val timeout = timeoutMs.coerceAtLeast(1)
-        if (timeout != appliedTimeoutMs) {
-            socket.soTimeout = timeout
-            appliedTimeoutMs = timeout
-        }
         return synchronized(receivePacket) {
+            // Inside the lock with the rest: appliedTimeoutMs only saves a setsockopt per datagram,
+            // and racing it would leave the socket on a timeout nobody asked for.
+            if (timeout != appliedTimeoutMs) {
+                socket.soTimeout = timeout
+                appliedTimeoutMs = timeout
+            }
             receivePacket.setData(buffer, 0, buffer.size)
             try {
                 socket.receive(receivePacket)

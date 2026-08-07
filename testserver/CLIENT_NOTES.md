@@ -577,7 +577,7 @@ client -> [LCP ConfAck id=0x2 ...]
   `require-pap` to remove it. `refuse-eap` alone does *not* do that — it only
   governs the reverse direction. Worth knowing if you ever point the client at
   a stock pppd LNS, which *will* offer EAP.)
-* Options the server sends: **MRU 1400**, **Async-Control-Character-Map 0**,
+* Options the server sends: **MRU** (see the note below), **Async-Control-Character-Map 0**,
   **Magic-Number**, and the auth option. Nothing else. It does **not** send
   PFC/ACFC, and it will reject CCP and VJ (`noccp novj novjccomp nobsdcomp
   nodeflate`), so there is no compression state to implement.
@@ -654,9 +654,15 @@ server -> [IPCP ConfAck id=0x2 ...]
   as pppd itself does:
   `sent [LCP ProtRej id=0x3 80 57 01 01 00 0e 01 0a ...]`.
 
-After IPCP the link carries plain IPv4 with protocol `0x0021`. MTU/MRU are
-1400. Pinging `10.10.10.1` over `ppp0` is the end-to-end check `verify.sh`
-performs.
+After IPCP the link carries plain IPv4 with protocol `0x0021`. Pinging
+`10.10.10.1` over `ppp0` is the end-to-end check `verify.sh` performs.
+
+> **MRU note.** The captures quoted in this section were taken when the lab ran
+> at MRU 1400 and are left as recorded. The lab now ships **1350**, on purpose:
+> a real Livebox Pro advertises 1350 while the client's own header budget comes
+> out at 1400, so the lower value is what exercises the client's clamp of the
+> TUN MTU to the peer's MRU. `options.xl2tpd` is the authority; `LiveServerE2eTest`
+> asserts the resulting TUN MTU.
 
 ---
 
@@ -680,7 +686,7 @@ PPP framing       FF 03 + 2-byte protocol, no FCS, no byte stuffing
 PPP auth          CHAP-MD5 offered; Nak to <auth chap 0x81> or <auth pap>
 PPP address       peer 10.10.10.1, you get 10.10.10.100..199
 DNS               10.10.10.1, 8.8.8.8   (IPCP options 129 / 131)
-MTU/MRU           1400
+MTU/MRU           1350                  (see the MRU note in section 5)
 ```
 
 Development order that works: **plaintext L2TP+PPP on 1701 first** (see 4.0,

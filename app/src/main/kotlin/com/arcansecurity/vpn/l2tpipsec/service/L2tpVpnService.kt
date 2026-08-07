@@ -34,7 +34,11 @@ import com.arcansecurity.vpn.l2tpipsec.platform.AndroidUdpSocketFactory
 import com.arcansecurity.vpn.l2tpipsec.ui.MainActivity
 import java.net.InetAddress
 import java.net.UnknownHostException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * The foreground [VpnService] that owns one L2TP/IPsec tunnel.
@@ -46,8 +50,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  2. Run [L2tpIpsecTunnel.run] — which blocks — on a dedicated thread, never on the main looper.
  *  3. Reconnect automatically with exponential backoff after any failure that is not the user's
  *     credentials being wrong (see [ReconnectPolicy]).
- *  4. Notice that the default network changed (Wi-Fi to mobile and back) and restart immediately,
- *     because the source address the IKE SA was negotiated on no longer exists.
+ *  4. Notice that the network underneath the tunnel changed (Wi-Fi to mobile and back) and restart
+ *     immediately, because the source address the IKE SA was negotiated on no longer exists.
  *  5. Publish everything worth showing to [VpnStatusRepository] so the UI needs no service binding.
  */
 class L2tpVpnService : VpnService() {
@@ -59,21 +63,38 @@ class L2tpVpnService : VpnService() {
     private val reconnectPolicy = ReconnectPolicy()
     private val running = AtomicBoolean(false)
 
-    /** Woken to cut a backoff sleep short. */
-    private val wakeUp = Object()
+    /** Signalled to cut a backoff sleep short. */
+    private val retryLock = ReentrantLock()
+    private val retryWakeUp = retryLock.newCondition()
 
     @Volatile private var worker: Thread? = null
     @Volatile private var tunnel: L2tpIpsecTunnel? = null
     @Volatile private var socketFactory: AndroidUdpSocketFactory? = null
-    @Volatile private var tunDescriptor: ParcelFileDescriptor? = null
+
+    /**
+     * The live TUN descriptor. An [AtomicReference] rather than a `@Volatile var` because both the
+     * tunnel thread (establishing) and whichever thread calls [interruptTunnel] (closing) touch it:
+     * a read-then-null on a plain field lets a close racing an establish drop the new descriptor on
+     * the floor, and a dropped `ParcelFileDescriptor` is a leaked file descriptor.
+     */
+    private val tunDescriptor = AtomicReference<ParcelFileDescriptor?>(null)
+
     @Volatile private var profile: VpnProfile = VpnProfile()
     @Volatile private var stopRequested = false
     @Volatile private var networkChangePending = false
-    @Volatile private var foregroundStarted = false
 
+    /** Latest `startId`, so [shutdown] can leave a newer start command alone. */
+    @Volatile private var lastStartId = 0
+
+    private val foregroundLock = Any()
+    private var foregroundState = ForegroundState.NOT_STARTED
+
+    private val connectivityLock = Any()
     private var connectivityManager: ConnectivityManager? = null
     private var registeredCallback: ConnectivityManager.NetworkCallback? = null
-    private var currentNetwork: Network? = null
+
+    /** Written by the connectivity callback thread, read by [unregisterNetworkCallback]. */
+    @Volatile private var currentNetwork: Network? = null
     @Volatile private var lastNetworkChangeMs = 0L
 
     override fun onCreate() {
@@ -84,23 +105,35 @@ class L2tpVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Whatever the action is, we were possibly launched with startForegroundService and owe
-        // the system a startForeground() call within a few seconds.
-        pushNotification()
-
-        when (intent?.action) {
-            ACTION_DISCONNECT -> {
-                log.i("Disconnect requested by the user")
-                stopTunnel(TunnelState.DISCONNECTING)
-            }
-
-            ACTION_CONNECT -> startTunnel()
-
-            else -> {
-                log.w("Unexpected start command (${intent?.action}); stopping")
-                stopTunnel(TunnelState.DISCONNECTING)
+        lastStartId = startId
+        // Whatever the action is, we were possibly launched with startForegroundService and owe the
+        // system a startForeground() call within a few seconds. A previous run may have left the
+        // state at FINISHED, so this command gets a fresh right to enter the foreground.
+        synchronized(foregroundLock) {
+            if (foregroundState == ForegroundState.FINISHED) {
+                foregroundState = ForegroundState.NOT_STARTED
             }
         }
+        pushNotification()
+
+        when (startActionFor(intent?.action, running.get())) {
+            StartAction.CONNECT -> startTunnel()
+
+            StartAction.DISCONNECT -> {
+                if (intent?.action == ACTION_DISCONNECT) {
+                    log.i("Disconnect requested by the user")
+                } else {
+                    log.w("Unexpected start command (${intent?.action}); stopping")
+                }
+                stopTunnel(TunnelState.DISCONNECTING)
+            }
+
+            StartAction.KEEP_RUNNING ->
+                log.w("Start command with no action while the tunnel runs; left alone")
+        }
+        // Deliberately not sticky: a VPN that silently reappears after the process was killed is
+        // worse than one the user has to start again. Always-on VPN does not rely on this — the
+        // platform restarts the service itself with the android.net.VpnService action.
         return START_NOT_STICKY
     }
 
@@ -111,11 +144,15 @@ class L2tpVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        // No join on the tunnel thread here. onDestroy runs on the main looper, the thread can take
+        // seconds to unwind its polite teardown, and it owns nothing that is still open by now:
+        // stopTunnel() has already closed the TUN and armed the socket reaper. Blocking the looper
+        // on it would only trade a leak we do not have for an ANR we would.
         stopTunnel(TunnelState.DISCONNECTING)
-        worker?.let { thread ->
-            runCatching { thread.join(THREAD_JOIN_TIMEOUT_MS) }
-        }
         unregisterNetworkCallback()
+        // Last, so a worker that outlives this instance can no longer re-post the notification:
+        // an ongoing "Connected" line with no service behind it is unkillable from the shade.
+        leaveForeground()
         super.onDestroy()
     }
 
@@ -123,7 +160,11 @@ class L2tpVpnService : VpnService() {
 
     private fun startTunnel() {
         if (!running.compareAndSet(false, true)) {
-            log.i("Connect requested while already running; ignored")
+            if (stopRequested) {
+                log.w("Connect requested while the previous tunnel is still stopping; ignored")
+            } else {
+                log.i("Connect requested while already running; ignored")
+            }
             return
         }
 
@@ -133,8 +174,8 @@ class L2tpVpnService : VpnService() {
             val message = validation.errors.joinToString("; ") { it.message }
             log.e("Refusing to connect, the profile is invalid: $message")
             VpnStatusRepository.onFailure(TunnelErrorKind.INTERNAL, message)
-            running.set(false)
             shutdown()
+            running.set(false)
             return
         }
 
@@ -177,20 +218,22 @@ class L2tpVpnService : VpnService() {
     private fun interruptTunnel() {
         runCatching { tunnel?.stop() }
         closeTunDescriptor()
-        synchronized(wakeUp) { wakeUp.notifyAll() }
+        retryLock.withLock { retryWakeUp.signalAll() }
 
-        val factory = socketFactory
+        val factory = socketFactory ?: return
         Thread({
             runCatching { Thread.sleep(SOCKET_CLOSE_GRACE_MS) }
-            runCatching { factory?.closeAll() }
+            runCatching { factory.closeAll() }
         }, "vpn-socket-reaper").apply { isDaemon = true }.start()
     }
 
     private fun shutdown() {
         unregisterNetworkCallback()
         VpnStatusRepository.onStopped()
-        stopForegroundCompat()
-        stopSelf()
+        leaveForeground()
+        // stopSelf(startId) rather than stopSelf(): if a newer start command has arrived since, it
+        // owns the service now and must not be torn down by the run that is finishing here.
+        stopSelf(lastStartId)
     }
 
     // ---------------------------------------------------------------- tunnel loop
@@ -249,9 +292,13 @@ class L2tpVpnService : VpnService() {
             log.e("Tunnel supervisor crashed", t)
             VpnStatusRepository.onFailure(TunnelErrorKind.INTERNAL, t.message ?: t.toString())
         } finally {
-            running.set(false)
+            // The order is load-bearing. `running` is what stops a Connect from installing a second
+            // worker, so it is released only once this one has finished tearing down. Clearing it
+            // first left a window in which a Connect started a new tunnel and this thread then went
+            // on to unregister its network callback and stopSelf() the service out from under it.
             worker = null
             shutdown()
+            running.set(false)
         }
     }
 
@@ -283,7 +330,10 @@ class L2tpVpnService : VpnService() {
         socketFactory = factory
         val tunProvider = AndroidTunProvider(
             service = this,
-            onEstablished = { descriptor -> tunDescriptor = descriptor },
+            onEstablished = { descriptor ->
+                // Anything still held here belongs to an attempt that is already over.
+                tunDescriptor.getAndSet(descriptor)?.let { stale -> runCatching { stale.close() } }
+            },
             sessionName = profile.name.ifBlank { VpnProfile.DEFAULT_NAME },
             configureIntent = configureIntent(),
             logger = logger,
@@ -332,12 +382,12 @@ class L2tpVpnService : VpnService() {
     /** Sleeps up to [delayMs], returning early when the user stops or the network moves. */
     private fun awaitRetry(delayMs: Long) {
         val deadline = SystemClock.elapsedRealtime() + delayMs
-        synchronized(wakeUp) {
+        retryLock.withLock {
             while (!stopRequested && !networkChangePending) {
                 val remaining = deadline - SystemClock.elapsedRealtime()
                 if (remaining <= 0) return
                 try {
-                    wakeUp.wait(remaining)
+                    retryWakeUp.await(remaining, TimeUnit.MILLISECONDS)
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
                     return
@@ -367,7 +417,7 @@ class L2tpVpnService : VpnService() {
         }
 
         override fun onStats(stats: TunnelStats) {
-            // Deliberately does not touch the notification: stats arrive far too often.
+            // Deliberately does not touch the notification: stats arrive once a second.
             VpnStatusRepository.onStats(stats)
         }
 
@@ -393,67 +443,79 @@ class L2tpVpnService : VpnService() {
      */
     private fun registerNetworkCallback() {
         val manager = connectivityManager ?: return
-        if (registeredCallback != null) return
+        synchronized(connectivityLock) {
+            if (registeredCallback != null) return
 
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                // Belt and braces: the request below already excludes VPNs, but the pre-31
-                // fallback watches the default network and would otherwise see our own tun0.
-                val capabilities = manager.getNetworkCapabilities(network)
-                if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
-                    log.d { "Ignoring our own VPN network $network" }
-                    return
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    // Belt and braces: the request below already excludes VPNs, but the pre-31
+                    // fallback watches the default network and would otherwise see our own tun0.
+                    val capabilities = manager.getNetworkCapabilities(network)
+                    if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+                        log.d { "Ignoring our own VPN network $network" }
+                        return
+                    }
+                    val previous = currentNetwork
+                    currentNetwork = network
+                    if (previous != null && previous != network) {
+                        onUnderlyingNetworkChanged("Underlying network changed")
+                    }
                 }
-                val previous = currentNetwork
-                currentNetwork = network
-                if (previous != null && previous != network) {
-                    onDefaultNetworkChanged("Default network changed")
+
+                override fun onLost(network: Network) {
+                    if (currentNetwork == network) currentNetwork = null
                 }
             }
 
-            override fun onLost(network: Network) {
-                if (currentNetwork == network) currentNetwork = null
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    // Reports only the single best match, so it is the underlying default network
+                    // with VPNs filtered out — exactly what the tunnel is built on.
+                    manager.registerBestMatchingNetworkCallback(
+                        request, callback, Handler(Looper.getMainLooper()),
+                    )
+                } else {
+                    // Older platforms have no best-match callback. Watching every matching network
+                    // would fire whenever a second one merely becomes available, so fall back to
+                    // the default network and rely on the VPN filter above. A handover that happens
+                    // while the tunnel is up may be missed; the L2TP keepalive notices it soon
+                    // enough.
+                    manager.registerDefaultNetworkCallback(callback)
+                }
             }
+                .onSuccess { registeredCallback = callback }
+                .onFailure { log.w("Could not register the network callback", it) }
         }
-
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-            .build()
-        runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                // Reports only the single best match, so it is the underlying default network
-                // with VPNs filtered out — exactly what the tunnel is built on.
-                manager.registerBestMatchingNetworkCallback(
-                    request, callback, Handler(Looper.getMainLooper()),
-                )
-            } else {
-                // Older platforms have no best-match callback. Watching every matching network
-                // would fire whenever a second one merely becomes available, so fall back to the
-                // default network and rely on the VPN filter above. A handover that happens while
-                // the tunnel is up may be missed; the L2TP keepalive notices it soon enough.
-                manager.registerDefaultNetworkCallback(callback)
-            }
-        }
-            .onSuccess { registeredCallback = callback }
-            .onFailure { log.w("Could not register the network callback", it) }
     }
 
+    /**
+     * Must be safe to call from the tunnel thread as well as the main looper: the lock is what
+     * guarantees the worker's `shutdown()` actually sees the callback the main thread registered.
+     * A callback that survives its service is a leaked `NetworkRequest`, and the platform only
+     * tolerates a hundred of those per uid before it starts throwing.
+     */
     private fun unregisterNetworkCallback() {
         val manager = connectivityManager ?: return
-        registeredCallback?.let { callback ->
-            runCatching { manager.unregisterNetworkCallback(callback) }
+        synchronized(connectivityLock) {
+            registeredCallback?.let { callback ->
+                runCatching { manager.unregisterNetworkCallback(callback) }
+                    .onFailure { log.w("Could not unregister the network callback", it) }
+            }
+            registeredCallback = null
+            currentNetwork = null
         }
-        registeredCallback = null
-        currentNetwork = null
     }
 
     /**
      * The IKE SA and both NAT-D hashes are bound to the source address we negotiated on. Once the
-     * default network moves that address is gone, so the only correct answer is to rebuild the
+     * underlying network moves that address is gone, so the only correct answer is to rebuild the
      * tunnel from scratch rather than wait for a keepalive to time out.
      */
-    private fun onDefaultNetworkChanged(reason: String) {
+    private fun onUnderlyingNetworkChanged(reason: String) {
         if (!running.get() || stopRequested) return
         // A handover resets the backoff, so anything that fires this repeatedly turns into a tight
         // reconnect loop. Rate-limiting it keeps a future mistake here merely slow instead of
@@ -473,6 +535,14 @@ class L2tpVpnService : VpnService() {
 
     // ---------------------------------------------------------------- notification
 
+    /**
+     * Renders the current state into the ongoing notification, entering the foreground on the first
+     * call after every start command.
+     *
+     * Called from the main looper and from the tunnel thread, hence the lock: without it a status
+     * update racing [leaveForeground] can re-post the notification after the service has left the
+     * foreground, leaving a "Connected" line in the shade with no tunnel behind it.
+     */
     private fun pushNotification() {
         val notification = notifications.build(
             state = VpnStatusRepository.state.value,
@@ -480,31 +550,44 @@ class L2tpVpnService : VpnService() {
             info = VpnStatusRepository.info.value,
             serverHost = profile.server,
         )
-        if (foregroundStarted) {
-            notifications.update(notification)
-            return
-        }
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(
-                    VpnNotifications.NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-                )
-            } else {
-                startForeground(VpnNotifications.NOTIFICATION_ID, notification)
+        synchronized(foregroundLock) {
+            when (foregroundState) {
+                ForegroundState.FINISHED -> return
+                ForegroundState.STARTED -> {
+                    notifications.update(notification)
+                    return
+                }
+
+                ForegroundState.NOT_STARTED -> Unit
             }
-            foregroundStarted = true
-        } catch (e: Exception) {
-            // Missing POST_NOTIFICATIONS or a background-start restriction; the tunnel can still
-            // run, it just will not survive an aggressive Doze.
-            log.w("Could not enter the foreground", e)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    // Must be a subset of android:foregroundServiceType in the manifest, which is
+                    // specialUse. The constant does not exist below API 34; there the untyped
+                    // overload resolves to the manifest declaration by itself.
+                    startForeground(
+                        VpnNotifications.NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                    )
+                } else {
+                    startForeground(VpnNotifications.NOTIFICATION_ID, notification)
+                }
+                foregroundState = ForegroundState.STARTED
+            } catch (e: Exception) {
+                // ForegroundServiceStartNotAllowedException on API 31+, i.e. something started us
+                // from the background without an exemption. Nothing here can recover, and the tunnel
+                // is doomed anyway once the system notices the missing startForeground().
+                log.e("Could not enter the foreground", e)
+            }
         }
     }
 
-    private fun stopForegroundCompat() {
-        foregroundStarted = false
-        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+    private fun leaveForeground() {
+        synchronized(foregroundLock) {
+            foregroundState = ForegroundState.FINISHED
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        }
     }
 
     private fun configureIntent(): PendingIntent = PendingIntent.getActivity(
@@ -515,11 +598,12 @@ class L2tpVpnService : VpnService() {
     )
 
     private fun closeTunDescriptor() {
-        tunDescriptor?.let { descriptor -> runCatching { descriptor.close() } }
-        tunDescriptor = null
+        tunDescriptor.getAndSet(null)?.let { descriptor -> runCatching { descriptor.close() } }
     }
 
     // ---------------------------------------------------------------- types
+
+    private enum class ForegroundState { NOT_STARTED, STARTED, FINISHED }
 
     private data class Failure(
         val kind: TunnelErrorKind,
@@ -544,7 +628,6 @@ class L2tpVpnService : VpnService() {
     companion object {
         private const val TAG = "Service"
         private const val WORKER_NAME = "l2tp-tunnel"
-        private const val THREAD_JOIN_TIMEOUT_MS = 3_000L
 
         /** A handover needs a moment for the new interface to get an address. */
         private const val NETWORK_CHANGE_DELAY_MS = 1_000L

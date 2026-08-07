@@ -1,168 +1,116 @@
 # L2TP/IPsec VPN for Android
 
-A native Android L2TP/IPsec PSK client that runs **entirely in userland** — no root, no `strongSwan`,
-no WireGuard proxy, no kernel `xfrm` state. Android removed its built-in L2TP/IPsec support in
+A native Android L2TP/IPsec PSK client that runs **entirely in userland** — no root, no strongSwan,
+no kernel `xfrm` state, no WireGuard proxy. Android removed its built-in L2TP/IPsec support in
 Android 12, leaving IKEv2/IPsec as the only option; this app puts L2TP/IPsec back on the device for
-routers that offer nothing else (the Orange Livebox Pro fibre being the case it was written for).
+routers that offer nothing else. It was written for an **Orange Livebox Pro** fibre router, which
+offers L2TP/IPsec PSK and nothing else.
 
-Default proposals match the target hardware:
+Every layer of the stack — ISAKMP/IKEv1, ESP, L2TPv2, PPP — is implemented in Kotlin inside the app
+process, on top of one ordinary UDP socket.
 
-| Phase | Proposal |
-| --- | --- |
-| IKE phase 1 | `aes256-sha256-modp2048` (AES-256-CBC, HMAC-SHA-256, DH group 14) |
-| IPsec phase 2 | `aes256-sha256` — AES-256-CBC + HMAC-SHA-256-128, ESP **transport** mode, no PFS |
-
-Both security associations are rekeyed before they expire, so the tunnel stays up indefinitely
-instead of dropping and reconnecting once an hour.
-
-## How it works without root
-
-An unprivileged Android app cannot open a raw IP socket, so it can never send an IP-protocol-50 ESP
-packet, and it cannot ask the kernel to install an IPsec SA. Everything is therefore done in
-process, on top of a single ordinary UDP socket:
+## The layering
 
 ```
-VpnService TUN  ──► IP packet
-                      └─ PPP frame                         (RFC 1661 / 1332 / 1994 / 2759)
-                          └─ L2TPv2 data message           (RFC 2661)
-                              └─ UDP 1701 → 1701           checksum 0, see below
-                                  └─ ESP transport mode    (RFC 4303, AES-256-CBC + HMAC-SHA-256-128)
-                                      └─ UDP 4500          (RFC 3948 UDP encapsulation)
-                                          └─ DatagramSocket, VpnService.protect()ed
+UDP/4500 datagram                    the only socket, VpnService.protect()ed
+  └─ ESP transport mode              RFC 4303 + RFC 3948 UDP encapsulation
+      └─ UDP 1701 → 1701             transport mode: there is NO inner IP header
+          └─ L2TPv2 data message     RFC 2661
+              └─ PPP frame           RFC 1661 / 1332 / 1994 / 2759
+                  └─ the user's IP packet, from/to the VpnService TUN
 ```
 
-Three consequences are worth spelling out, because they drive most of the design:
+Three consequences drive most of the design, and each is explained in
+[docs/protocol.md](docs/protocol.md):
 
-* **ESP is always UDP-encapsulated.** The client advertises its NAT-D source hash computed over
-  port `0`, which no responder can ever match, so the peer concludes there is a NAT in the path and
-  switches to UDP/4500. This is exactly what strongSwan's `forceencaps=yes` does, and here it is not
-  an optimisation but a requirement.
+* **ESP is always UDP-encapsulated.** An unprivileged Android app cannot open a raw IP socket, so it
+  can never send IP-protocol-50 ESP. The client forces encapsulation by computing its source NAT-D
+  hash over port `0` — exactly strongSwan's `forceencaps=yes`. This is a requirement, not an
+  optimisation.
 * **There is no inner IP header.** ESP runs in *transport* mode, so the protected data is the
-  UDP/1701 datagram itself and the outer IP header of the UDP/4500 packet is the only one on the
-  wire. The ICV covers the ESP header, IV and ciphertext but not the IP header, which is why NAT
-  rewriting is harmless.
-* **The inner UDP checksum is zero.** IPv4 allows it, and it side-steps the RFC 3948 §3.1.2
-  checksum fix-up that would otherwise be needed once a NAT rewrites the source address. Linux's
-  own L2TP implementation does the same.
+  UDP/1701 datagram itself. The ICV covers the ESP header, IV and ciphertext but not the IP header,
+  which is why NAT rewriting on the path is harmless.
+* **The inner UDP checksum is zero.** IPv4 permits it, and it side-steps the RFC 3948 §3.1.2
+  checksum fix-up. Linux's own L2TP implementation does the same.
 
 ## Modules
 
 ```
-core/   pure Kotlin/JVM — the entire protocol stack, no Android SDK, unit-testable
-  util/    bounds-checked big-endian readers/writers, hex/byte helpers, logging seam
-  crypto/  DH MODP groups, HMAC PRF and key expansion, CBC ciphers, algorithm vocabulary
-  ike/     ISAKMP codec, IKEv1 main/aggressive mode, quick mode, NAT-T, DPD, delete
-  esp/     ESP transport-mode encode/decode, anti-replay window, UDP-encapsulation framing
-  net/     IPv4/UDP codecs and the internet checksum
-  l2tp/    L2TPv2 AVPs, control channel with Ns/Nr and retransmission, data path
-  ppp/     LCP, PAP / CHAP-MD5 / MS-CHAPv2 (with its own MD4), IPCP with RFC 1877 DNS
-  tunnel/  VpnConfig, platform seams, MTU budgeting, and L2tpIpsecTunnel which drives it all
-app/    Android — VpnService, platform adapters, encrypted profile storage, Compose UI
-testserver/  a real strongSwan + xl2tpd + pppd lab server in Docker, used by the E2E tests
+core/         pure Kotlin/JVM — the whole protocol stack, no Android SDK, unit-testable
+  util/         bounds-checked big-endian readers/writers, hex helpers, logging seam
+  crypto/       DH MODP groups, HMAC PRF and key expansion, CBC ciphers, algorithm vocabulary
+  ike/          ISAKMP codec, IKEv1 main/aggressive mode, quick mode, NAT-T, DPD, Delete
+  esp/          ESP transport-mode encode/decode, anti-replay window, UDP-encapsulation framing
+  net/          IPv4/UDP codecs and the internet checksum
+  l2tp/         L2TPv2 AVPs, control channel with Ns/Nr and retransmission, data path
+  ppp/          LCP, PAP / CHAP-MD5 / MS-CHAPv2 (with its own MD4), IPCP with RFC 1877 DNS
+  tunnel/       VpnConfig, platform seams, MTU budgeting, and L2tpIpsecTunnel which drives it all
+app/          Android — VpnService, platform adapters, encrypted profile storage, Compose UI
+testserver/   a real strongSwan + xl2tpd + pppd lab in Docker, driven by the live tests
 ```
 
-Keeping the stack in a plain JVM module is what makes it testable: the whole client can be driven
+Keeping the stack in a plain JVM module is what makes it testable: the entire client can be driven
 against a real server from a JUnit test, with ordinary `DatagramSocket`s and an in-memory TUN.
 
-## Status
+## Defaults
 
-Verified against a real strongSwan + xl2tpd + pppd server configured exactly like the target
-router (`testserver/`):
-
-| Check | Result |
+| Phase | Proposal |
 | --- | --- |
-| `:core` unit tests | 283 pass (277 hermetic, 6 need the lab server) |
-| `:app` unit tests | 30 pass |
-| End-to-end against the live server | 4 pass — tunnel established, ICMP echo round-trips through the full stack |
-| Rekeying against the live server | both directions pass — SAs replaced by us and by the server, traffic never stops |
-| PPP authentication | PAP, CHAP-MD5 and MS-CHAPv2 all negotiate and authenticate |
-| Wrong PSK / wrong password | fail fast with the correct, distinguishable error |
-| `:app:lintDebug` | no errors |
+| IKE phase 1 | `aes256-sha256-modp2048` — AES-256-CBC, HMAC-SHA-256, DH group 14, PSK, main mode |
+| IPsec phase 2 | `aes256-sha256` — AES-256-CBC + HMAC-SHA-256-128, ESP **transport** mode, no PFS |
+| PPP auth | MS-CHAPv2, then CHAP-MD5, then PAP |
 
-The negotiated result on the wire, read out of the client's own trace:
-`AES_CBC_256/SHA2_256/MODP_2048` for phase 1, `ESP_AES_CBC_256/HMAC_SHA2_256_128` in
-UDP-encapsulated transport mode for phase 2, MTU 1400.
+These match the Livebox Pro exactly; see [docs/interoperability.md](docs/interoperability.md).
 
-## Building
+## Building and running
 
 ```bash
-./gradlew :core:test          # protocol unit tests
+./gradlew :core:test          # protocol unit tests (the live ones self-skip)
+./gradlew :app:test           # Android-free app-layer tests
 ./gradlew :app:assembleDebug  # APK at app/build/outputs/apk/debug/
 ```
 
-Requires JDK 21 and the Android SDK (compileSdk 37). Gradle 9.7 and AGP 9.2 — AGP now supplies
-Kotlin for Android modules itself, so the `kotlin-android` plugin is deliberately absent.
+Requires the Android SDK (`compileSdk 37`, `minSdk 26`) and a JDK the Gradle wrapper accepts. The
+Kotlin Android plugin is deliberately absent from `:app` — AGP supplies Kotlin for Android modules
+itself.
 
-## End-to-end tests against a real server
+On the device: enter server address, pre-shared key, user name and password, and press Connect. The
+advanced section exposes the phase 1 / phase 2 proposals, exchange mode, local identity, PPP
+authentication list, MTU, DNS override and the IPv6 blackhole. Full field reference in
+[docs/configuration.md](docs/configuration.md).
 
-`testserver/` builds a container running strongSwan and xl2tpd configured exactly like the target
-router. The live tests are skipped unless a server is pointed at:
+## Status
 
-```bash
-testserver/run.sh                     # start the lab, prints the server IP
-./gradlew :core:test -Dl2tp.test.server=172.28.0.10 --tests '*LiveServerE2eTest'
-testserver/stop.sh
-```
+Verified against the Docker lab in `testserver/` (strongSwan + xl2tpd + pppd configured like the
+target router) and against the real Livebox Pro:
 
-They establish the tunnel for real and then push an ICMP echo request through the TUN and wait for
-the reply to come back up the whole stack.
+| Check | Result |
+| --- | --- |
+| Tunnel establishment | IKE phase 1 → phase 2 → L2TP → PPP → TUN, end to end |
+| Data path | ICMP echo round-trips through the whole stack |
+| PPP authentication | PAP, CHAP-MD5 and MS-CHAPv2 all negotiate and authenticate |
+| Rekeying | both SAs replaced, by us and by the server, without interrupting traffic |
+| Wrong PSK / wrong password | fail fast with distinguishable, actionable errors |
+| Test suite | 358 `:core` tests and 50 `:app` tests, of which 6 need the lab and self-skip without it |
+| Static analysis | `:app:lintDebug` reports no issues; both modules compile without warnings |
 
-Rekeying needs a lab with short SA lifetimes, because there is no point waiting an hour for one:
+Known limitations are listed honestly in each document, and collected in
+[docs/architecture.md](docs/architecture.md#known-limitations).
 
-```bash
-IKE_LIFETIME=3m ESP_LIFETIME=2m testserver/run.sh
-./gradlew :core:test -Dl2tp.test.server=172.28.0.10 -Dl2tp.test.rekey=true --tests '*LiveRekeyTest'
-```
+## Documentation
 
-That test watches both SAs get replaced and then pings again *after* the superseded ones have been
-deleted, which is the case that would break if the server treated the IPsec SAs as children of the
-ISAKMP SA they were negotiated under.
+| Document | What it covers |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | Module layout, the layering, the threading model, the platform seams |
+| [docs/protocol.md](docs/protocol.md) | What is implemented at each layer, with RFCs — and the non-obvious decisions |
+| [docs/rekeying.md](docs/rekeying.md) | SA lifetimes, the jittered deadline, make-before-break, what is not covered |
+| [docs/android.md](docs/android.md) | `VpnService` lifecycle, `protect()`, foreground service, reconnect, the traps |
+| [docs/configuration.md](docs/configuration.md) | Every field of `VpnConfig` and `VpnProfile`: meaning, default, when to change it |
+| [docs/testing.md](docs/testing.md) | Hermetic tests, the Docker lab, how to run each suite |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Getting logs off a device, every `TunnelErrorKind`, observed symptoms |
+| [docs/interoperability.md](docs/interoperability.md) | The Livebox Pro's settings, and what the lab taught us about strongSwan and xl2tpd |
 
-The other direction — the router deciding to rekey and the client having to answer — needs a lab
-that rekeys on its own schedule:
+[docs/README.md](docs/README.md) is the index, with suggested reading orders.
 
-```bash
-ESP_LIFETIME=2m IKE_LIFETIME=30m REKEY=yes MARGINTIME=60s testserver/run.sh
-./gradlew :core:test -Dl2tp.test.server=172.28.0.10 -Dl2tp.test.rekey.responder=true \
-    --tests '*LiveRekeyTest'
-```
-
-## Rekeying
-
-Every IPsec and ISAKMP SA carries a lifetime, and when it runs out the peer stops accepting the
-keys. The client replaces both before that happens:
-
-* **Schedules off the negotiated lifetime, not the proposed one.** strongSwan echoes back whatever
-  the initiator asked for, but a router that shortens it would otherwise leave the client
-  renegotiating after the SA was already gone.
-* **Rekeys at 75–85% of the lifetime**, jittered. Peers commonly rekey at 90%, so going first keeps
-  the client on the initiator side of the exchange, which is much the simpler side.
-* **Make before break.** The new outbound SA takes over immediately, while the SA it replaced stays
-  valid for inbound traffic for another 30 seconds — the peer keeps using it until it has installed
-  the new one. Inbound packets are demultiplexed on the SPI in the ESP header, so both generations
-  are decrypted with the right keys.
-* **Answers a rekey the peer starts.** A router on its own schedule will send a Quick Mode of its
-  own; the client responds to it, and replays its answer if message 1 is repeated rather than
-  negotiating a second SA.
-* **Distinguishes a delete of the superseded SA from a delete of the live one.** The first is
-  routine housekeeping after a rekey; only the second is a reason to act.
-* Also triggers on ESP sequence-number exhaustion, and renegotiates phase 1 immediately if the peer
-  drops the ISAKMP SA.
-
-Not covered: a peer that renegotiates **phase 1** by starting a Main Mode of its own. That message
-arrives under cookies we know nothing about and is dropped, and the tunnel falls back to
-reconnecting. Rekeying phase 1 well before the peer's own deadline is what keeps this from
-happening in practice.
-
-All of this runs on a maintenance thread that owns the ISAKMP queue, so a rekey — which blocks on
-the peer for a few round trips — never stalls the packet pump.
-
-## Configuration on the device
-
-Server address, PSK, username and password are the only required fields. The advanced section
-exposes the phase 1 / phase 2 proposals, IKE exchange mode, local identity type, PPP authentication
-protocols, MTU and IPv6 blocking. Secrets are kept in `EncryptedSharedPreferences`.
-
-MTU defaults to 1400. The stack also computes the largest MTU that survives every header
-(`core/.../tunnel/Mtu.kt`) and uses the smaller of the two, which avoids the classic "ping works but
-TLS hangs" symptom.
+`testserver/CLIENT_NOTES.md` holds the raw byte-level findings from the lab and is worth reading
+before touching anything on the wire.
