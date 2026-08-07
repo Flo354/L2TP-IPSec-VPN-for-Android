@@ -76,6 +76,20 @@ data class VpnConfig(
     /** Route all IPv6 into the tunnel's blackhole so traffic cannot leak around an IPv4-only VPN. */
     val blockIpv6: Boolean = true,
 
+    /**
+     * Replace the IPsec and ISAKMP SAs before their negotiated lifetimes run out, instead of
+     * letting the tunnel drop and reconnect. Turning this off is only useful for diagnosing a peer
+     * that mishandles rekeying.
+     */
+    val rekeyEnabled: Boolean = true,
+
+    /**
+     * How long a superseded IPsec SA keeps being accepted for inbound traffic. The peer goes on
+     * sending on the old SA until it has installed the new one, so retiring it the instant the
+     * rekey completes drops the packets in flight.
+     */
+    val saOverlapMs: Int = 30_000,
+
     val ikeRetransmitTimeoutMs: Int = 3_000,
     val ikeMaxRetransmits: Int = 5,
     val connectTimeoutMs: Int = 45_000,

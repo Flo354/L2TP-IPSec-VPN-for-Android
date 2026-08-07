@@ -1,7 +1,10 @@
 package com.arcansecurity.vpn.l2tpipsec.core.ike
 
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.CbcCipher
+import com.arcansecurity.vpn.l2tpipsec.core.crypto.DhGroup
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.DiffieHellman
+import com.arcansecurity.vpn.l2tpipsec.core.crypto.EspEncryption
+import com.arcansecurity.vpn.l2tpipsec.core.crypto.EspIntegrity
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.IkeAuthMethod
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.Prf
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.Clock
@@ -48,6 +51,13 @@ class IkeV1Negotiator(
 
     private var dpdSequence: Int = randomNonZeroInt() and 0x7FFFFFFF
 
+    /**
+     * Answers we already sent to peer-initiated Quick Modes, keyed by message id. A lost message 2
+     * makes the peer repeat message 1; replaying the same answer keeps both sides on one SA pair
+     * instead of negotiating a second one.
+     */
+    private val answeredQuickModes = LinkedHashMap<Int, ByteArray>()
+
     // ---------------------------------------------------------------------------------------
     // Phase 1
     // ---------------------------------------------------------------------------------------
@@ -90,7 +100,7 @@ class IkeV1Negotiator(
         val header2 = IsakmpHeader.decode(raw2)
         responderCookie = header2.responderCookie
         val chain2 = IsakmpCodec.decodeMessage(raw2, header2)
-        checkResponderPhase1Sa(chain2)
+        val lifetimeSeconds = checkResponderPhase1Sa(chain2)
         selectNatTraversalFlavor(chain2)
 
         val dh = DiffieHellman.generate(config.phase1.dhGroup)
@@ -141,7 +151,7 @@ class IkeV1Negotiator(
         val hashR = requirePayload(chain6.find<HashPayload>(), "HASH_R").data
         verifyHashR(keys.skeyid, gxr, dh.publicValue, saBody, remoteId, hashR)
 
-        return buildPhase1Result(keys, finalIv, nat, idBody, remoteId)
+        return buildPhase1Result(keys, finalIv, nat, idBody, remoteId, lifetimeSeconds)
     }
 
     /**
@@ -173,7 +183,7 @@ class IkeV1Negotiator(
         val header2 = IsakmpHeader.decode(raw2)
         responderCookie = header2.responderCookie
         val chain2 = IsakmpCodec.decodeMessage(raw2, header2)
-        checkResponderPhase1Sa(chain2)
+        val lifetimeSeconds = checkResponderPhase1Sa(chain2)
         selectNatTraversalFlavor(chain2)
 
         val gxr = requirePayload(chain2.find<KeyExchangePayload>(), "responder key exchange").data
@@ -201,7 +211,9 @@ class IkeV1Negotiator(
                 IsakmpFlags.ENCRYPTION, 0, PayloadType.HASH, ciphertext3,
             ),
         )
-        return buildPhase1Result(keys, crypto.lastBlock(ciphertext3), nat, idBody, remoteId)
+        return buildPhase1Result(
+            keys, crypto.lastBlock(ciphertext3), nat, idBody, remoteId, lifetimeSeconds,
+        )
     }
 
     private fun buildPhase1Result(
@@ -210,6 +222,7 @@ class IkeV1Negotiator(
         nat: NatStatus,
         localId: ByteArray,
         remoteId: ByteArray,
+        lifetimeSeconds: Int,
     ) = Phase1Result(
         initiatorCookie = initiatorCookie,
         responderCookie = responderCookie,
@@ -227,6 +240,7 @@ class IkeV1Negotiator(
         natTraversalFlavor = flavor,
         localIdentity = localId,
         remoteIdentity = remoteId,
+        lifetimeSeconds = lifetimeSeconds,
     )
 
     // ---------------------------------------------------------------------------------------
@@ -342,19 +356,251 @@ class IkeV1Negotiator(
     }
 
     // ---------------------------------------------------------------------------------------
+    // Quick Mode, responder side
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * Answers a Quick Mode the peer started, which is how a router that rekeys on its own schedule
+     * replaces an expiring IPsec SA. Without this the peer's rekey would go unanswered and it would
+     * eventually delete the SA under us.
+     *
+     * Returns the new SA pair, or `null` when the message was a retransmission we simply
+     * re-acknowledged.
+     */
+    fun respondToQuickMode(phase1: Phase1Result, rawMessage: ByteArray): Phase2Result? {
+        activePhase1 = phase1
+        val crypto = cryptoFor(phase1)
+        val header1 = IsakmpHeader.decode(rawMessage)
+        if (!header1.isEncrypted) throw ProtocolException("quick mode message 1 is not encrypted")
+        val messageId = header1.messageId
+        val messageIdBytes = int32(messageId)
+
+        answeredQuickModes[messageId]?.let { cached ->
+            log.d { "re-sending our answer to a repeated quick mode message id $messageId" }
+            transport.sendIsakmp(cached)
+            return null
+        }
+
+        var iv = Bytes.truncate(
+            crypto.prf.digest(phase1.phase1Iv, messageIdBytes), crypto.cipher.blockBytes,
+        )
+        val ciphertext1 = payloadBlockOf(rawMessage)
+        val chain1 = IsakmpCodec.decodeBlock(crypto.decrypt(ciphertext1, iv), header1.nextPayload)
+        iv = crypto.lastBlock(ciphertext1)
+
+        if (chain1.indexOfType(PayloadType.HASH) != 0) {
+            throw ProtocolException("quick mode message 1 does not start with HASH(1)")
+        }
+        val expectedHash1 = crypto.prf.mac(phase1.skeyidA, messageIdBytes, chain1.bytesAfter(0))
+        if (!Bytes.constantTimeEquals(expectedHash1, chain1.bodyAt(0))) {
+            throw TunnelException(
+                TunnelErrorKind.IKE_AUTH_FAILED,
+                "quick mode HASH(1) mismatch; the ISAKMP SA keys disagree",
+            )
+        }
+
+        val ni = requirePayload(chain1.find<NoncePayload>(), "initiator nonce").data
+        val offer = selectPeerPhase2Offer(chain1, transport.natTraversalActive)
+
+        // Honour whatever PFS group the peer asked for rather than only our configured one: a
+        // router with PFS enabled would otherwise get an answer it has to reject.
+        val peerKe = chain1.find<KeyExchangePayload>()
+        val pfs = offer.pfsGroup?.let { DiffieHellman.generate(it) }
+        if (pfs != null && peerKe == null) {
+            throw ProtocolException("peer asked for PFS group ${offer.pfsGroup} but sent no key exchange")
+        }
+
+        val inboundSpi = randomSpi()
+        val nr = Bytes.random(NONCE_BYTES)
+        val responsePayloads = buildList {
+            add(SaPayload(listOf(ProposalPayload(1, ProtocolId.ESP, int32(inboundSpi), listOf(offer.transform)))))
+            add(NoncePayload(nr))
+            if (pfs != null) add(KeyExchangePayload(pfs.publicValue))
+            // Echo the initiator's selectors verbatim: narrowing them is what makes a peer reject
+            // the answer, and we accept whatever it proposed for the L2TP flow anyway.
+            addAll(chain1.payloads.filterIsInstance<IdentificationPayload>())
+        }
+        val hash2 = crypto.prf.mac(
+            phase1.skeyidA, messageIdBytes, ni, IsakmpCodec.encodeChain(responsePayloads),
+        )
+        val ciphertext2 = crypto.encrypt(chainAfterHash(hash2, responsePayloads), iv)
+        val message2 = IsakmpCodec.buildMessage(
+            phase1.initiatorCookie, phase1.responderCookie, ExchangeType.QUICK_MODE,
+            IsakmpFlags.ENCRYPTION, messageId, PayloadType.HASH, ciphertext2,
+        )
+        transport.sendIsakmp(message2)
+        rememberQuickModeAnswer(messageId, message2)
+        iv = crypto.lastBlock(ciphertext2)
+
+        val qmSecret = if (pfs == null) ByteArray(0) else pfs.computeSharedSecret(peerKe!!.data)
+        val encryptionKeyBytes = offer.encryption.keyBytes
+        val needed = encryptionKeyBytes + offer.integrity.keyBytes
+        val inbound = IkeKeyDerivation.keymat(
+            crypto.prf, phase1.skeyidD, qmSecret, ProtocolId.ESP, inboundSpi, ni, nr, needed,
+        )
+        val outbound = IkeKeyDerivation.keymat(
+            crypto.prf, phase1.skeyidD, qmSecret, ProtocolId.ESP, offer.spi, ni, nr, needed,
+        )
+
+        awaitQuickModeConfirmation(crypto, phase1, messageId, messageIdBytes, ni, nr, iv)
+
+        val result = Phase2Result(
+            inboundSpi = inboundSpi,
+            outboundSpi = offer.spi,
+            inboundEncryptionKey = inbound.copyOfRange(0, encryptionKeyBytes),
+            inboundIntegrityKey = inbound.copyOfRange(encryptionKeyBytes, needed),
+            outboundEncryptionKey = outbound.copyOfRange(0, encryptionKeyBytes),
+            outboundIntegrityKey = outbound.copyOfRange(encryptionKeyBytes, needed),
+            encryption = offer.encryption,
+            integrity = offer.integrity,
+            lifetimeSeconds = offer.lifetimeSeconds,
+            udpEncapsulated = EncapsulationMode.isUdpEncapsulated(offer.encapsulationMode),
+        )
+        log.i(
+            "answered a peer-initiated quick mode: in=0x${Integer.toHexString(result.inboundSpi)} " +
+                "out=0x${Integer.toHexString(result.outboundSpi)} lifetime=${result.lifetimeSeconds}s",
+        )
+        return result
+    }
+
+    /**
+     * Waits for HASH(3). The SA is usable as soon as message 2 is on the wire, so a missing
+     * confirmation is logged rather than fatal — the peer may simply have lost it, and refusing
+     * the SA at that point would drop traffic the peer is already sending on it.
+     */
+    private fun awaitQuickModeConfirmation(
+        crypto: SaCrypto,
+        phase1: Phase1Result,
+        messageId: Int,
+        messageIdBytes: ByteArray,
+        ni: ByteArray,
+        nr: ByteArray,
+        iv: ByteArray,
+    ) {
+        val expected = crypto.prf.mac(phase1.skeyidA, ByteArray(1), messageIdBytes, ni, nr)
+        val deadline = clock.nowMs() + config.ikeRetransmitTimeoutMs * 2
+        while (true) {
+            val left = deadline - clock.nowMs()
+            if (left <= 0) break
+            val raw = transport.receiveIsakmp(left.toInt()) ?: break
+            val header = try {
+                IsakmpHeader.decode(raw)
+            } catch (e: ProtocolException) {
+                log.w("dropping a malformed datagram while awaiting HASH(3): ${e.message}")
+                continue
+            }
+            if (header.exchangeType == ExchangeType.INFORMATIONAL) {
+                processInformational(raw)
+                continue
+            }
+            if (header.exchangeType != ExchangeType.QUICK_MODE || header.messageId != messageId) {
+                log.w("ignoring $header while awaiting HASH(3)")
+                continue
+            }
+            val chain = try {
+                IsakmpCodec.decodeBlock(crypto.decrypt(payloadBlockOf(raw), iv), header.nextPayload)
+            } catch (e: ProtocolException) {
+                log.w("could not decode quick mode message 3: ${e.message}")
+                continue
+            }
+            if (chain.indexOfType(PayloadType.HASH) == 0 &&
+                Bytes.constantTimeEquals(expected, chain.bodyAt(0))
+            ) {
+                log.d { "quick mode message 3 verified for message id $messageId" }
+                return
+            }
+            log.w("quick mode message 3 did not carry a valid HASH(3)")
+        }
+        log.w("no quick mode HASH(3) arrived; keeping the SA anyway")
+    }
+
+    private fun rememberQuickModeAnswer(messageId: Int, message: ByteArray) {
+        answeredQuickModes[messageId] = message
+        while (answeredQuickModes.size > REMEMBERED_QUICK_MODES) {
+            answeredQuickModes.remove(answeredQuickModes.keys.first())
+        }
+    }
+
+    private class Phase2Offer(
+        val spi: Int,
+        val transform: TransformPayload,
+        val encryption: EspEncryption,
+        val integrity: EspIntegrity,
+        val encapsulationMode: Int,
+        val lifetimeSeconds: Int,
+        val pfsGroup: DhGroup?,
+    )
+
+    /** Picks the first transform in the peer's offer that we can actually run. */
+    private fun selectPeerPhase2Offer(chain: PayloadChain, requireUdpEncapsulation: Boolean): Phase2Offer {
+        val sa = requirePayload(chain.find<SaPayload>(), "quick mode SA")
+        val proposal = sa.proposals.firstOrNull { it.protocolId == ProtocolId.ESP }
+            ?: throw TunnelException(
+                TunnelErrorKind.IPSEC_SA_FAILED,
+                "peer's quick mode carries no ESP proposal",
+            )
+        if (proposal.spi.size != ESP_SPI_BYTES) {
+            throw ProtocolException("peer ESP SPI is ${proposal.spi.size} bytes, expected $ESP_SPI_BYTES")
+        }
+        for (transform in proposal.transforms) {
+            val keyBits = transform.intAttribute(Phase2Attribute.KEY_LENGTH)
+            val encryption = EspEncryption.find(transform.transformId, keyBits) ?: continue
+            val integrity = transform.intAttribute(Phase2Attribute.AUTHENTICATION_ALGORITHM)
+                ?.let { EspIntegrity.find(it) } ?: continue
+            val encapsulationMode =
+                transform.intAttribute(Phase2Attribute.ENCAPSULATION_MODE) ?: EncapsulationMode.TUNNEL
+            if (requireUdpEncapsulation && !EncapsulationMode.isUdpEncapsulated(encapsulationMode)) continue
+            val group = transform.intAttribute(Phase2Attribute.GROUP_DESCRIPTION)
+            val pfsGroup = if (group == null) null else DhGroup.find(group) ?: continue
+            val lifetime =
+                if (transform.intAttribute(Phase2Attribute.SA_LIFE_TYPE) == Phase2Attribute.LIFE_TYPE_SECONDS) {
+                    transform.intAttribute(Phase2Attribute.SA_LIFE_DURATION) ?: config.phase2.lifetimeSeconds
+                } else {
+                    config.phase2.lifetimeSeconds
+                }
+            return Phase2Offer(
+                spi = ByteReader(proposal.spi).i32(),
+                transform = transform,
+                encryption = encryption,
+                integrity = integrity,
+                encapsulationMode = encapsulationMode,
+                lifetimeSeconds = lifetime,
+                pfsGroup = pfsGroup,
+            )
+        }
+        bestEffort("NO_PROPOSAL_CHOSEN") {
+            sendInformational(
+                requireNotNull(activePhase1),
+                listOf(NotifyPayload(NotifyType.NO_PROPOSAL_CHOSEN, ProtocolId.ESP, proposal.spi)),
+            )
+        }
+        throw TunnelException(
+            TunnelErrorKind.IKE_PROPOSAL_REJECTED,
+            "peer's quick mode offered no transform this client supports",
+        )
+    }
+
+    // ---------------------------------------------------------------------------------------
     // Informational exchanges
     // ---------------------------------------------------------------------------------------
 
     /** ISAKMP Informational carrying Delete for the IPsec SA then the ISAKMP SA. Best effort. */
     fun sendDeleteNotifications(phase1: Phase1Result, phase2: Phase2Result?) {
-        if (phase2 != null) {
-            bestEffort("IPsec delete") {
-                sendInformational(
-                    phase1,
-                    listOf(DeletePayload(ProtocolId.ESP, listOf(int32(phase2.inboundSpi)))),
-                )
-            }
+        if (phase2 != null) sendEspDelete(phase1, phase2.inboundSpi)
+        sendIsakmpDelete(phase1)
+    }
+
+    /**
+     * Tells the peer to stop sending on one IPsec SA. The SPI is ours because a Delete names the
+     * sender's inbound SAs; this is what retires a superseded SA after a rekey.
+     */
+    fun sendEspDelete(phase1: Phase1Result, inboundSpi: Int) {
+        bestEffort("IPsec delete") {
+            sendInformational(phase1, listOf(DeletePayload(ProtocolId.ESP, listOf(int32(inboundSpi)))))
         }
+    }
+
+    fun sendIsakmpDelete(phase1: Phase1Result) {
         bestEffort("ISAKMP delete") {
             val spi = Bytes.concat(phase1.initiatorCookie, phase1.responderCookie)
             sendInformational(phase1, listOf(DeletePayload(ProtocolId.ISAKMP, listOf(spi))))
@@ -362,12 +608,14 @@ class IkeV1Negotiator(
     }
 
     /**
-     * Handles a received Informational exchange (DPD R-U-THERE, Delete, Notify). Returns false if
-     * the peer deleted the SA.
+     * Handles a received Informational exchange (DPD R-U-THERE, Delete, Notify) and reports what
+     * the peer asked to tear down. Deciding what a delete *means* is the tunnel's job: after a
+     * rekey the peer deletes the superseded IPsec SA, which must not bring the connection down.
      */
-    fun handleInformational(phase1: Phase1Result, rawMessage: ByteArray): Boolean {
-        val chain = decodeInformational(phase1, rawMessage) ?: return true
-        var alive = true
+    fun handleInformational(phase1: Phase1Result, rawMessage: ByteArray): InformationalResult {
+        val chain = decodeInformational(phase1, rawMessage) ?: return InformationalResult()
+        val deletedEsp = mutableListOf<Int>()
+        var isakmpDeleted = false
         for (payload in chain.payloads) {
             when (payload) {
                 is NotifyPayload -> when (payload.notifyType) {
@@ -377,17 +625,29 @@ class IkeV1Negotiator(
                     else -> log.i("peer sent notify ${payload.notifyType}")
                 }
 
-                is DeletePayload -> {
-                    if (payload.protocolId == ProtocolId.ISAKMP || payload.protocolId == ProtocolId.ESP) {
-                        log.i("peer deleted the SA (protocol ${payload.protocolId})")
-                        alive = false
+                is DeletePayload -> when (payload.protocolId) {
+                    ProtocolId.ESP -> payload.spis.forEach { spi ->
+                        if (spi.size == ESP_SPI_BYTES) {
+                            val value = ByteReader(spi).i32()
+                            log.i("peer deleted IPsec SA 0x${Integer.toHexString(value)}")
+                            deletedEsp += value
+                        } else {
+                            log.w("peer deleted an IPsec SA with a ${spi.size}-byte SPI; ignoring")
+                        }
                     }
+
+                    ProtocolId.ISAKMP -> {
+                        log.i("peer deleted the ISAKMP SA")
+                        isakmpDeleted = true
+                    }
+
+                    else -> log.i("peer deleted an SA for protocol ${payload.protocolId}")
                 }
 
                 else -> log.d { "ignoring payload ${payload.type} in an informational exchange" }
             }
         }
-        return alive
+        return InformationalResult(deletedEsp, isakmpDeleted)
     }
 
     /** Sends a DPD R-U-THERE and returns the sequence number used. */
@@ -594,7 +854,8 @@ class IkeV1Negotiator(
     }
 
     /** The responder must echo the single transform we offered; anything else is unusable. */
-    private fun checkResponderPhase1Sa(chain: PayloadChain) {
+    /** Returns the ISAKMP SA lifetime the responder settled on, which may be shorter than ours. */
+    private fun checkResponderPhase1Sa(chain: PayloadChain): Int {
         val sa = requirePayload(chain.find<SaPayload>(), "responder SA")
         val transform = sa.proposals.firstOrNull()?.transforms?.firstOrNull()
             ?: throw ProtocolException("responder SA payload carries no transform")
@@ -612,6 +873,13 @@ class IkeV1Negotiator(
                 TunnelErrorKind.IKE_PROPOSAL_REJECTED,
                 "responder chose an ISAKMP transform we did not propose: $transform",
             )
+        }
+        // Schedule the rekey off the peer's number: proposing three hours and being granted ten
+        // minutes would otherwise leave us renegotiating long after the SA had been torn down.
+        return if (transform.intAttribute(Phase1Attribute.LIFE_TYPE) == Phase1Attribute.LIFE_TYPE_SECONDS) {
+            transform.intAttribute(Phase1Attribute.LIFE_DURATION) ?: p.lifetimeSeconds
+        } else {
+            p.lifetimeSeconds
         }
     }
 
@@ -762,6 +1030,14 @@ class IkeV1Negotiator(
         }
     }
 
+    /**
+     * The port the peer is actually listening on right now. It is 500 for the initial exchange and
+     * 4500 once we have floated, which matters when phase 1 is renegotiated over an established
+     * NAT-T session: hashing the wrong port would make both ends read the NAT state backwards.
+     */
+    private fun peerIkePort(): Int =
+        if (transport.natTraversalActive) config.natTraversalPort else config.ikePort
+
     private fun natdHash(address: InetAddress, port: Int): ByteArray =
         IkeKeyDerivation.natDiscoveryHash(prf, initiatorCookie, responderCookie, ipv4(address), port)
 
@@ -772,7 +1048,7 @@ class IkeV1Negotiator(
         val sourcePort = if (config.forceUdpEncapsulation) 0 else transport.localPort
         val payloadType = flavor.natdPayloadType
         return listOf(
-            NatDiscoveryPayload(payloadType, natdHash(transport.remoteAddress, config.ikePort)),
+            NatDiscoveryPayload(payloadType, natdHash(transport.remoteAddress, peerIkePort())),
             NatDiscoveryPayload(payloadType, natdHash(transport.localAddress, sourcePort)),
         )
     }
@@ -791,7 +1067,7 @@ class IkeV1Negotiator(
             return NatStatus(config.forceUdpEncapsulation, false)
         }
         val ourHash = natdHash(transport.localAddress, transport.localPort)
-        val peerHash = natdHash(transport.remoteAddress, config.ikePort)
+        val peerHash = natdHash(transport.remoteAddress, peerIkePort())
         val localMismatch = !Bytes.constantTimeEquals(received[0].hash, ourHash)
         val remoteMismatch = received.size >= 2 &&
             received.drop(1).none { Bytes.constantTimeEquals(it.hash, peerHash) }
@@ -922,5 +1198,6 @@ class IkeV1Negotiator(
         const val NONCE_BYTES = 32
         const val ESP_SPI_BYTES = 4
         const val MAX_BACKOFF_FACTOR = 8
+        const val REMEMBERED_QUICK_MODES = 4
     }
 }

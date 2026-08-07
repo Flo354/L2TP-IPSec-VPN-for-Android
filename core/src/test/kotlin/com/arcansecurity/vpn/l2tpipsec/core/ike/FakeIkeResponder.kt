@@ -111,6 +111,10 @@ class FakeIkeResponder(
     private lateinit var initiatorIdBody: ByteArray
 
     private var quickModeStage = 0
+    /** Message id of a Quick Mode this responder started itself, so answers can be told apart. */
+    private var peerQuickModeMessageId: Int? = null
+    private var peerQuickModeIv: ByteArray? = null
+    private var peerQuickModeAnswered = false
     private var quickModeIv: ByteArray? = null
     private var quickModeSecret = ByteArray(0)
     private lateinit var quickModeNi: ByteArray
@@ -238,6 +242,11 @@ class FakeIkeResponder(
     private fun quickMode(header: IsakmpHeader, raw: ByteArray): ByteArray? {
         val ciphertext = raw.copyOfRange(IsakmpCodec.HEADER_SIZE, raw.size)
         val messageId = int32(header.messageId)
+        if (header.messageId == peerQuickModeMessageId) {
+            // A client that repeats its answer gets nothing back; the exchange is already done.
+            if (peerQuickModeAnswered) return null
+            return peerQuickModeMessage3(header, raw)
+        }
         return if (quickModeStage == 0) {
             val iv = Bytes.truncate(prf.digest(phase1Iv, messageId), cipher.blockBytes)
             val chain = IsakmpCodec.decodeBlock(
@@ -252,6 +261,8 @@ class FakeIkeResponder(
             val expected = prf.mac(skeyidA, ByteArray(1), messageId, quickModeNi, quickModeNr)
             quickModeHash3Verified = Bytes.constantTimeEquals(expected, chain.bodyAt(0))
             deriveEspKeys()
+            // Ready for the next exchange: a rekey is just another Quick Mode.
+            quickModeStage = 0
             null
         }
     }
@@ -296,6 +307,68 @@ class FakeIkeResponder(
         return IsakmpCodec.buildMessage(
             initiatorCookie, responderCookie, ExchangeType.QUICK_MODE, IsakmpFlags.ENCRYPTION,
             header.messageId, PayloadType.HASH, ciphertext,
+        )
+    }
+
+    /**
+     * Starts a Quick Mode of its own, which is what a router that rekeys on its own schedule does.
+     * The client is the responder for this exchange.
+     */
+    fun startQuickMode(messageId: Int = 0x51a10000): ByteArray {
+        peerQuickModeMessageId = messageId
+        peerQuickModeAnswered = false
+        quickModeNi = Bytes.random(32)
+        quickModeSecret = ByteArray(0)
+        inboundSpi = ByteReader(Bytes.randomNonZero(4)).i32()
+        val transform = TransformPayload(
+            1,
+            espEncryption.transformId,
+            listOf(
+                SaAttribute.tv(Phase2Attribute.SA_LIFE_TYPE, Phase2Attribute.LIFE_TYPE_SECONDS),
+                SaAttribute.tlv32(Phase2Attribute.SA_LIFE_DURATION, 3600),
+                SaAttribute.tv(Phase2Attribute.ENCAPSULATION_MODE, EncapsulationMode.UDP_TRANSPORT),
+                SaAttribute.tv(Phase2Attribute.AUTHENTICATION_ALGORITHM, espIntegrity.attributeValue),
+                SaAttribute.tv(Phase2Attribute.KEY_LENGTH, espEncryption.keyBits),
+            ),
+        )
+        val payloads = listOf<IkePayload>(
+            SaPayload(listOf(ProposalPayload(1, ProtocolId.ESP, int32(inboundSpi), listOf(transform)))),
+            NoncePayload(quickModeNi),
+        )
+        val mid = int32(messageId)
+        val hash1 = prf.mac(skeyidA, mid, IsakmpCodec.encodeChain(payloads))
+        val iv = Bytes.truncate(prf.digest(phase1Iv, mid), cipher.blockBytes)
+        val ciphertext = cipher.encrypt(encryptionKey, iv, pad(chainAfterHash(hash1, payloads)))
+        peerQuickModeIv = lastBlock(ciphertext)
+        return IsakmpCodec.buildMessage(
+            initiatorCookie, responderCookie, ExchangeType.QUICK_MODE, IsakmpFlags.ENCRYPTION,
+            messageId, PayloadType.HASH, ciphertext,
+        )
+    }
+
+    /** Verifies the client's HASH(2), derives the keys and returns HASH(3). */
+    private fun peerQuickModeMessage3(header: IsakmpHeader, raw: ByteArray): ByteArray {
+        val ciphertext = raw.copyOfRange(IsakmpCodec.HEADER_SIZE, raw.size)
+        val mid = int32(header.messageId)
+        val chain = IsakmpCodec.decodeBlock(
+            cipher.decrypt(encryptionKey, peerQuickModeIv!!, ciphertext), header.nextPayload,
+        )
+        val expected = prf.mac(skeyidA, mid, quickModeNi, chain.bytesAfter(0))
+        quickModeHash1Verified = chain.indexOfType(PayloadType.HASH) == 0 &&
+            Bytes.constantTimeEquals(expected, chain.bodyAt(0))
+        quickModeNr = chain.find<NoncePayload>()!!.data
+        outboundSpi = ByteReader(chain.find<SaPayload>()!!.proposals[0].spi).i32()
+        selectedEncapsulationMode = chain.find<SaPayload>()!!.proposals[0].transforms[0]
+            .intAttribute(Phase2Attribute.ENCAPSULATION_MODE) ?: EncapsulationMode.TUNNEL
+        deriveEspKeys()
+        val hash3 = prf.mac(skeyidA, ByteArray(1), mid, quickModeNi, quickModeNr)
+        val reply = cipher.encrypt(
+            encryptionKey, lastBlock(ciphertext), pad(IsakmpCodec.encodeChain(listOf(HashPayload(hash3)))),
+        )
+        peerQuickModeAnswered = true
+        return IsakmpCodec.buildMessage(
+            initiatorCookie, responderCookie, ExchangeType.QUICK_MODE, IsakmpFlags.ENCRYPTION,
+            header.messageId, PayloadType.HASH, reply,
         )
     }
 
@@ -369,6 +442,11 @@ class FakeIkeResponder(
                 Bytes.concat(initiatorCookie, responderCookie), int32(sequence),
             ),
         ),
+    )
+
+    fun buildEspDelete(spi: Int, messageId: Int = 0x0e5d0e5d): ByteArray = buildInformational(
+        listOf(DeletePayload(ProtocolId.ESP, listOf(int32(spi)))),
+        messageId,
     )
 
     fun buildIsakmpDelete(): ByteArray = buildInformational(

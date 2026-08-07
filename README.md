@@ -12,6 +12,9 @@ Default proposals match the target hardware:
 | IKE phase 1 | `aes256-sha256-modp2048` (AES-256-CBC, HMAC-SHA-256, DH group 14) |
 | IPsec phase 2 | `aes256-sha256` — AES-256-CBC + HMAC-SHA-256-128, ESP **transport** mode, no PFS |
 
+Both security associations are rekeyed before they expire, so the tunnel stays up indefinitely
+instead of dropping and reconnecting once an hour.
+
 ## How it works without root
 
 An unprivileged Android app cannot open a raw IP socket, so it can never send an IP-protocol-50 ESP
@@ -68,9 +71,10 @@ router (`testserver/`):
 
 | Check | Result |
 | --- | --- |
-| `:core` unit tests | 275 pass |
+| `:core` unit tests | 282 pass |
 | `:app` unit tests | 30 pass |
 | End-to-end against the live server | 4 pass — tunnel established, ICMP echo round-trips through the full stack |
+| Rekeying against the live server | 1 pass — both SAs replaced, traffic never stops |
 | PPP authentication | PAP, CHAP-MD5 and MS-CHAPv2 all negotiate and authenticate |
 | Wrong PSK / wrong password | fail fast with the correct, distinguishable error |
 | `:app:lintDebug` | no errors |
@@ -102,6 +106,42 @@ testserver/stop.sh
 
 They establish the tunnel for real and then push an ICMP echo request through the TUN and wait for
 the reply to come back up the whole stack.
+
+Rekeying needs a lab with short SA lifetimes, because there is no point waiting an hour for one:
+
+```bash
+IKE_LIFETIME=3m ESP_LIFETIME=2m testserver/run.sh
+./gradlew :core:test -Dl2tp.test.server=172.28.0.10 -Dl2tp.test.rekey=true --tests '*LiveRekeyTest'
+```
+
+That test watches both SAs get replaced and then pings again *after* the superseded ones have been
+deleted, which is the case that would break if the server treated the IPsec SAs as children of the
+ISAKMP SA they were negotiated under.
+
+## Rekeying
+
+Every IPsec and ISAKMP SA carries a lifetime, and when it runs out the peer stops accepting the
+keys. The client replaces both before that happens:
+
+* **Schedules off the negotiated lifetime, not the proposed one.** strongSwan echoes back whatever
+  the initiator asked for, but a router that shortens it would otherwise leave the client
+  renegotiating after the SA was already gone.
+* **Rekeys at 75–85% of the lifetime**, jittered. Peers commonly rekey at 90%, so going first keeps
+  the client on the initiator side of the exchange, which is much the simpler side.
+* **Make before break.** The new outbound SA takes over immediately, while the SA it replaced stays
+  valid for inbound traffic for another 30 seconds — the peer keeps using it until it has installed
+  the new one. Inbound packets are demultiplexed on the SPI in the ESP header, so both generations
+  are decrypted with the right keys.
+* **Answers a rekey the peer starts.** A router on its own schedule will send a Quick Mode of its
+  own; the client responds to it, and replays its answer if message 1 is repeated rather than
+  negotiating a second SA.
+* **Distinguishes a delete of the superseded SA from a delete of the live one.** The first is
+  routine housekeeping after a rekey; only the second is a reason to act.
+* Also triggers on ESP sequence-number exhaustion, and renegotiates phase 1 immediately if the peer
+  drops the ISAKMP SA.
+
+All of this runs on a maintenance thread that owns the ISAKMP queue, so a rekey — which blocks on
+the peer for a few round trips — never stalls the packet pump.
 
 ## Configuration on the device
 
