@@ -24,11 +24,8 @@ process, on top of one ordinary UDP socket.
 >
 > **What that means if you are considering using it.** It has been verified by execution, not merely
 > generated: it establishes a real tunnel against a real router and against a strongSwan lab, and the
-> tests pin the RFC vectors. But **no human expert has reviewed the IKEv1 or ESP code**, and the
-> credential-storage path has never run on a device — see
-> [docs/security.md](docs/security.md#what-is-not-claimed). This is a VPN client that handles a
-> pre-shared key and a password. Read it before you trust it with yours, and judge it on the code and
-> the tests rather than on where it came from.
+> tests pin the RFC vectors. But **no human expert has reviewed the IKEv1 or ESP code**. Read it
+> before you trust it, and judge it on the code and the tests rather than on where it came from.
 
 ## The layering
 
