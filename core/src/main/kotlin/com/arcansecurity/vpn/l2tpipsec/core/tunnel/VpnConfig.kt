@@ -5,6 +5,7 @@ import com.arcansecurity.vpn.l2tpipsec.core.crypto.EspEncryption
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.EspIntegrity
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.IkeEncryption
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.IkeHash
+import com.arcansecurity.vpn.l2tpipsec.core.util.redacted
 
 enum class IkeExchangeMode { MAIN, AGGRESSIVE }
 
@@ -42,10 +43,18 @@ data class Phase2Proposal(
 
 enum class PppAuthProtocol { PAP, CHAP_MD5, MSCHAP_V2 }
 
+/**
+ * Everything the stack needs to bring a tunnel up.
+ *
+ * Two of these fields are credentials, so the class overrides [toString]; see the note there before
+ * adding another one.
+ */
 data class VpnConfig(
     val serverHost: String,
+    /** IKE pre-shared key. Never logged: see [toString]. */
     val presharedKey: String,
     val username: String,
+    /** PPP password. Never logged: see [toString]. */
     val password: String,
 
     val exchangeMode: IkeExchangeMode = IkeExchangeMode.MAIN,
@@ -106,9 +115,37 @@ data class VpnConfig(
     val debugLogging: Boolean = false,
 ) {
     init {
+        // These messages travel on an exception, which goes further than a log line, so they name
+        // the offending field and never quote a credential's value.
         require(serverHost.isNotBlank()) { "serverHost is required" }
         require(presharedKey.isNotEmpty()) { "presharedKey is required" }
         require(mtu in 576..1500) { "mtu out of range: $mtu" }
         require(allowedPppAuth.isNotEmpty()) { "at least one PPP auth protocol is required" }
     }
+
+    /**
+     * Written out by hand because the one a `data class` generates prints every property, the
+     * pre-shared key and the PPP password in the clear.
+     *
+     * A config reaches a string more easily than it looks: an interpolation in a log line, a
+     * `require` message, an exception a crash reporter serialises. The Android app keeps the trace
+     * in a buffer the user can copy or share, so any of those would put both credentials on their
+     * way off the device. Both are therefore reduced to whether they are set; everything else is
+     * the operational detail that makes a shared trace worth reading.
+     *
+     * Add a property below only after deciding which of the two it is.
+     * `VpnConfigSecrecyTest` enumerates the class and will fail until that decision is recorded.
+     */
+    override fun toString(): String =
+        "VpnConfig(serverHost=$serverHost, presharedKey=${redacted(presharedKey)}, " +
+            "username=$username, password=${redacted(password)}, exchangeMode=$exchangeMode, " +
+            "localIdentity=$localIdentity, phase1=$phase1, phase2=$phase2, " +
+            "forceUdpEncapsulation=$forceUdpEncapsulation, ikePort=$ikePort, " +
+            "natTraversalPort=$natTraversalPort, l2tpPort=$l2tpPort, " +
+            "allowedPppAuth=$allowedPppAuth, mtu=$mtu, l2tpHostName=$l2tpHostName, " +
+            "dnsOverride=$dnsOverride, blockIpv6=$blockIpv6, rekeyEnabled=$rekeyEnabled, " +
+            "saOverlapMs=$saOverlapMs, ikeRetransmitTimeoutMs=$ikeRetransmitTimeoutMs, " +
+            "ikeMaxRetransmits=$ikeMaxRetransmits, connectTimeoutMs=$connectTimeoutMs, " +
+            "natKeepaliveIntervalMs=$natKeepaliveIntervalMs, " +
+            "l2tpHelloIntervalMs=$l2tpHelloIntervalMs, debugLogging=$debugLogging)"
 }

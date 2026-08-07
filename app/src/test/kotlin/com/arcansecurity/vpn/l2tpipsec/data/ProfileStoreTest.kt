@@ -1,23 +1,236 @@
 package com.arcansecurity.vpn.l2tpipsec.data
 
-import android.content.SharedPreferences
-import com.arcansecurity.vpn.l2tpipsec.core.crypto.DhGroup
-import com.arcansecurity.vpn.l2tpipsec.core.crypto.IkeHash
-import com.arcansecurity.vpn.l2tpipsec.core.tunnel.IkeExchangeMode
-import com.arcansecurity.vpn.l2tpipsec.core.tunnel.PppAuthProtocol
-import com.arcansecurity.vpn.l2tpipsec.core.util.VpnLogger
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
-import com.arcansecurity.vpn.l2tpipsec.core.util.Log as CoreLog
+import org.junit.rules.Timeout
 
+/**
+ * [PreferenceProfileStore]: multi-profile CRUD, the active-profile rules, the schema-1 migration
+ * and the read-failure path, all against a fake [android.content.SharedPreferences] on a plain JVM.
+ */
 class ProfileStoreTest {
 
-    private val logged = mutableListOf<String>()
-    private val log = CoreLog("Test", VpnLogger { level, _, message, _ -> logged += "$level $message" })
+    /** Everything here suspends on a lock or a flow; a regression must fail, not hang. */
+    @get:Rule
+    val timeout: Timeout = Timeout.seconds(30)
 
-    // ------------------------------------------------------------------ decryption failures
+    private val home = VpnProfile(id = "home", name = "Home", server = "home.example.com")
+    private val work = VpnProfile(id = "work", name = "Work", server = "work.example.com")
+    private val lab = VpnProfile(id = "lab", name = "Lab", server = "lab.example.com")
+
+    // ------------------------------------------------------------------ loading
+
+    @Test
+    fun `a fresh install loads to an empty, ready store`() {
+        val fixture = StoreFixture()
+
+        assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
+        assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
+        assertNull(fixture.store.activeProfileId.value)
+        assertTrue(fixture.store.usesEncryptedStorage.value)
+    }
+
+    @Test
+    fun `the plaintext fallback is reported so the UI can warn about it`() {
+        val fixture = StoreFixture(encrypted = false)
+
+        assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
+        assertFalse(fixture.store.usesEncryptedStorage.value)
+    }
+
+    // ------------------------------------------------------------------ multiple profiles
+
+    @Test
+    fun `profiles are created, edited in place and read back in order`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+
+        fixture.upsert(home)
+        fixture.upsert(work)
+        fixture.upsert(lab)
+        fixture.upsert(work.copy(server = "vpn.corp.example.com"))
+
+        assertEquals(listOf("home", "work", "lab"), fixture.store.profiles.value.map { it.id })
+        assertEquals(
+            "an edit must not move the profile to the end of the list",
+            "vpn.corp.example.com",
+            fixture.store.profiles.value[1].server,
+        )
+    }
+
+    @Test
+    fun `the order survives a reload`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(lab)
+        fixture.upsert(home)
+        fixture.upsert(work)
+        fixture.setActive("home")
+
+        val reloaded = StoreFixture(fixture.prefs)
+        reloaded.awaitLoaded()
+
+        assertEquals(listOf("lab", "home", "work"), reloaded.store.profiles.value.map { it.id })
+        assertEquals("home", reloaded.store.activeProfileId.value)
+    }
+
+    @Test
+    fun `the first profile created becomes the active one`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+
+        fixture.upsert(home)
+        fixture.upsert(work)
+
+        assertEquals("home", fixture.store.activeProfileId.value)
+        assertEquals(home, fixture.store.activeProfile)
+    }
+
+    @Test
+    fun `editing the active profile does not change which one is active`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+        fixture.upsert(work)
+        fixture.setActive("work")
+
+        fixture.upsert(home.copy(name = "House"))
+
+        assertEquals("work", fixture.store.activeProfileId.value)
+    }
+
+    @Test
+    fun `an unknown id can neither be activated nor deleted, and neither throws`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+
+        fixture.setActive("nope")
+        fixture.delete("nope")
+
+        assertEquals(listOf(home), fixture.store.profiles.value)
+        assertEquals("home", fixture.store.activeProfileId.value)
+    }
+
+    @Test
+    fun `a profile with an id that would corrupt the order list is refused`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+
+        fixture.upsert(VpnProfile(id = "a,b", name = "Bad"))
+
+        assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
+        assertTrue(fixture.logText(), fixture.logged.any { it.startsWith("ERROR") })
+    }
+
+    // ------------------------------------------------------------------ deleting
+
+    @Test
+    fun `deleting the active profile activates the one that took its place`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+        fixture.upsert(work)
+        fixture.upsert(lab)
+        fixture.setActive("work")
+
+        fixture.delete("work")
+
+        assertEquals(listOf("home", "lab"), fixture.store.profiles.value.map { it.id })
+        assertEquals("lab", fixture.store.activeProfileId.value)
+    }
+
+    @Test
+    fun `deleting the last profile in the list falls back to the new last one`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+        fixture.upsert(work)
+        fixture.setActive("work")
+
+        fixture.delete("work")
+
+        assertEquals("home", fixture.store.activeProfileId.value)
+    }
+
+    @Test
+    fun `deleting an inactive profile leaves the active one alone`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+        fixture.upsert(work)
+        fixture.setActive("work")
+
+        fixture.delete("home")
+
+        assertEquals("work", fixture.store.activeProfileId.value)
+    }
+
+    @Test
+    fun `deleting the only profile leaves nothing active`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+
+        fixture.delete("home")
+
+        assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
+        assertNull(fixture.store.activeProfileId.value)
+        assertNull(fixture.store.activeProfile)
+    }
+
+    /**
+     * Ids are never reused, so nothing would inherit them — but leaving a deleted profile's
+     * credentials on disk keeps data the user explicitly asked to be rid of, and every extra copy
+     * of a pre-shared key is another thing a forensic image can find.
+     */
+    @Test
+    fun `deleting a profile wipes its secrets`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+        fixture.secrets.store("home", SecretKind.PRESHARED_KEY, "psk".toCharArray())
+        fixture.secrets.store("home", SecretKind.PASSWORD, "hunter2".toCharArray())
+        fixture.flushSecrets()
+
+        fixture.delete("home")
+        fixture.flushSecrets()
+
+        assertFalse(fixture.secrets.isSet("home", SecretKind.PRESHARED_KEY))
+        assertFalse(fixture.secrets.isSet("home", SecretKind.PASSWORD))
+        assertNull(fixture.reader.read("home", SecretKind.PRESHARED_KEY))
+        assertNull(fixture.reader.read("home", SecretKind.PASSWORD))
+        assertTrue(
+            "credentials left on disk: ${fixture.prefs.values.keys}",
+            fixture.prefs.values.keys.none { it.startsWith("secret.") },
+        )
+    }
+
+    @Test
+    fun `deleting a profile leaves the other profiles' secrets alone`() {
+        val fixture = StoreFixture()
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+        fixture.upsert(work)
+        fixture.secrets.store("home", SecretKind.PRESHARED_KEY, "home-psk".toCharArray())
+        fixture.secrets.store("work", SecretKind.PRESHARED_KEY, "work-psk".toCharArray())
+        fixture.flushSecrets()
+
+        fixture.delete("home")
+        fixture.flushSecrets()
+
+        assertArrayEquals(
+            "work-psk".toCharArray(),
+            fixture.reader.read("work", SecretKind.PRESHARED_KEY),
+        )
+    }
+
+    // ------------------------------------------------------------------ a store that fails
 
     /**
      * The crash this guards against: `EncryptedSharedPreferences` throws `SecurityException` out of
@@ -26,217 +239,260 @@ class ProfileStoreTest {
      * the user to reach the screen that would let them retype the profile.
      */
     @Test
-    fun `a store whose reads throw yields a blank profile instead of propagating`() {
-        val stored = readProfile(ThrowingPreferences(), log)
+    fun `a store whose reads throw becomes an empty, usable store instead of an exception`() {
+        val fixture = StoreFixture(FakePreferences(readsFail = true))
 
-        assertTrue(stored.unreadable)
-        assertEquals(VpnProfile(), stored.profile)
-        assertTrue(logged.toString(), logged.any { it.startsWith("ERROR") })
+        assertEquals(ProfileStoreState.UNREADABLE, fixture.awaitLoaded())
+        assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
+        assertNull(fixture.store.activeProfileId.value)
+        assertTrue(fixture.logText(), fixture.logged.any { it.startsWith("ERROR") })
     }
 
     /**
      * A partial failure discards the readable values too. Pinning it here because the alternative
-     * is defensible and someone will be tempted: a form showing the server and user name with a
-     * silently empty pre-shared key is worse than an obviously blank one.
+     * is defensible and someone will be tempted: a list showing the server and user name with a
+     * silently missing pre-shared key is worse than an obviously empty one.
      */
     @Test
-    fun `one unreadable value discards the whole profile, not just that field`() {
-        val prefs = FakePreferences(
-            mapOf("name" to "Home", "server" to "vpn.example.com", "psk" to "secret"),
-            unreadableKeys = setOf("psk"),
+    fun `one unreadable value discards the whole store, not just that profile`() {
+        val disk = FakePreferences(
+            mapOf(
+                KEY_ORDER to "home,work",
+                "profile.home.name" to "Home",
+                "profile.work.name" to "Work",
+            ),
+            unreadableKeys = setOf("profile.work.name"),
         )
 
-        val stored = readProfile(prefs, log)
+        val fixture = StoreFixture(disk)
 
-        assertTrue(stored.unreadable)
-        assertEquals(VpnProfile(), stored.profile)
+        assertEquals(ProfileStoreState.UNREADABLE, fixture.awaitLoaded())
+        assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
     }
 
     @Test
-    fun `a write the store refuses is reported rather than thrown`() {
-        val written = writeProfile(ThrowingPreferences(), VpnProfile(server = "host"), log)
+    fun `an unreadable store is usable again as soon as a write succeeds`() {
+        val disk = FakePreferences(readsFail = true)
+        val fixture = StoreFixture(disk)
+        assertEquals(ProfileStoreState.UNREADABLE, fixture.awaitLoaded())
 
-        assertFalse(written)
-        assertTrue(logged.toString(), logged.any { it.startsWith("ERROR") })
+        disk.readsFail = false
+        fixture.upsert(home)
+
+        assertEquals(ProfileStoreState.READY, fixture.store.state.value)
+        assertEquals(listOf(home), fixture.store.profiles.value)
     }
 
-    // ------------------------------------------------------------------ the happy path
+    @Test
+    fun `a store that refuses writes keeps the profile in memory and stays quiet about it`() {
+        val fixture = StoreFixture(FakePreferences(writesFail = true))
+        fixture.awaitLoaded()
+
+        fixture.upsert(home)
+        fixture.setActive("home")
+        fixture.delete("home")
+
+        // Nothing threw, and the in-memory view followed every call.
+        assertEquals(emptyList<VpnProfile>(), fixture.store.profiles.value)
+        assertTrue(fixture.logText(), fixture.logged.any { it.startsWith("ERROR") })
+    }
+
+    // ------------------------------------------------------------------ migration
 
     @Test
-    fun `a profile survives a write and a read unchanged`() {
-        val prefs = FakePreferences()
-        val original = VpnProfile(
-            name = "Livebox",
-            server = "vpn.example.com",
-            presharedKey = "psk",
-            username = "road",
-            password = "warrior",
-            exchangeMode = IkeExchangeMode.AGGRESSIVE,
-            phase1Hash = IkeHash.SHA2_512,
-            phase2PfsGroup = DhGroup.MODP_1536,
-            allowedPppAuth = listOf(PppAuthProtocol.PAP),
-            mtu = 1380,
-            dnsServers = "9.9.9.9",
-            blockIpv6 = false,
-            forceUdpEncapsulation = false,
-            debugLogging = true,
+    fun `a single-profile install comes back as one profile with both its secrets`() {
+        val disk = legacyPreferences()
+        val fixture = StoreFixture(disk)
+
+        assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
+
+        val profile = fixture.store.profiles.value.single()
+        assertEquals(LEGACY_PROFILE_ID, profile.id)
+        assertEquals("Home", profile.name)
+        assertEquals("vpn.example.com", profile.server)
+        assertEquals("alice", profile.username)
+        assertEquals(1380, profile.mtu)
+        assertEquals(profile.id, fixture.store.activeProfileId.value)
+
+        assertTrue(fixture.secrets.isSet(profile.id, SecretKind.PRESHARED_KEY))
+        assertTrue(fixture.secrets.isSet(profile.id, SecretKind.PASSWORD))
+        assertArrayEquals(
+            "s3cr3t-psk".toCharArray(),
+            fixture.reader.read(profile.id, SecretKind.PRESHARED_KEY),
         )
-
-        assertTrue(writeProfile(prefs, original, log))
-        val stored = readProfile(prefs, log)
-
-        assertFalse(stored.unreadable)
-        assertEquals(original, stored.profile)
+        assertArrayEquals(
+            "hunter2".toCharArray(),
+            fixture.reader.read(profile.id, SecretKind.PASSWORD),
+        )
     }
 
     @Test
-    fun `an empty store reads back the defaults`() {
-        val stored = readProfile(FakePreferences(), log)
+    fun `migration moves the plaintext credentials out of the old keys`() {
+        val disk = legacyPreferences()
 
-        assertFalse(stored.unreadable)
-        assertEquals(VpnProfile(), stored.profile)
+        StoreFixture(disk).awaitLoaded()
+
+        assertFalse("psk" in disk.values.keys)
+        assertFalse("password" in disk.values.keys)
+        assertFalse("server" in disk.values.keys)
+        assertTrue(disk.values.containsKey("secret.$LEGACY_PROFILE_ID.psk"))
+        assertEquals(SCHEMA_VERSION, disk.values[KEY_SCHEMA])
+    }
+
+    @Test
+    fun `the migrated profile survives the next start`() {
+        val disk = legacyPreferences()
+        StoreFixture(disk).awaitLoaded()
+
+        val restarted = StoreFixture(disk)
+        assertEquals(ProfileStoreState.READY, restarted.awaitLoaded())
+
+        assertEquals(listOf(LEGACY_PROFILE_ID), restarted.store.profiles.value.map { it.id })
+        assertArrayEquals(
+            "s3cr3t-psk".toCharArray(),
+            restarted.reader.read(LEGACY_PROFILE_ID, SecretKind.PRESHARED_KEY),
+        )
+    }
+
+    @Test
+    fun `migration does not resurrect a profile the user has since deleted`() {
+        val disk = legacyPreferences()
+        val fixture = StoreFixture(disk)
+        fixture.awaitLoaded()
+        fixture.delete(LEGACY_PROFILE_ID)
+
+        val restarted = StoreFixture(disk)
+        restarted.awaitLoaded()
+
+        assertEquals(emptyList<VpnProfile>(), restarted.store.profiles.value)
     }
 
     /**
-     * "No PFS" is a real choice, not the absence of one, so it is stored as an explicit sentinel.
-     * Turning it off has to actually turn it off: writing nothing would leave the previous group on
-     * disk and silently re-enable PFS on the next read.
+     * The ordering that matters most, isolated: the *credentials* are what has to be durable before
+     * the plaintext copies are dropped. Here the profile rows write perfectly well and only the
+     * credential does not — so a migration that trusted the profile write alone would delete the
+     * user's only copy of their pre-shared key.
      */
     @Test
-    fun `clearing the PFS group persists as no PFS rather than leaving the old one`() {
-        val prefs = FakePreferences()
-        writeProfile(prefs, VpnProfile(phase2PfsGroup = DhGroup.MODP_2048), log)
-        assertEquals(DhGroup.MODP_2048, readProfile(prefs, log).profile.phase2PfsGroup)
+    fun `the schema-1 keys survive a migration whose credentials would not persist`() {
+        val disk = FakePreferences(
+            legacyValues(),
+            unwritableKeys = setOf("secret.$LEGACY_PROFILE_ID.psk"),
+        )
 
-        writeProfile(prefs, VpnProfile(phase2PfsGroup = null), log)
+        val fixture = StoreFixture(disk)
+        assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
 
-        assertEquals(null, readProfile(prefs, log).profile.phase2PfsGroup)
+        assertEquals("s3cr3t-psk", disk.values["psk"])
+        assertEquals("hunter2", disk.values["password"])
+        assertFalse("the new layout must not claim the migration happened", disk.values.containsKey(KEY_ORDER))
+        // …and the session still works from memory.
+        assertArrayEquals(
+            "s3cr3t-psk".toCharArray(),
+            fixture.reader.read(LEGACY_PROFILE_ID, SecretKind.PRESHARED_KEY),
+        )
     }
 
     /**
-     * A value written by a newer build is not a decryption failure: it falls back on its own and
-     * leaves the rest of the profile — and the unreadable flag — alone.
+     * The same guarantee seen from a store that refuses every write: nothing is thrown away, and
+     * the next start on a store that works again completes the move.
      */
     @Test
-    fun `an unparseable enum falls back without flagging the profile unreadable`() {
-        val prefs = FakePreferences(mapOf("p1_hash" to "SHA3_512", "server" to "vpn.example.com"))
+    fun `a migration that cannot persist keeps the old data for the next attempt`() {
+        val disk = legacyPreferences()
+        disk.writesFail = true
 
-        val stored = readProfile(prefs, log)
+        val fixture = StoreFixture(disk)
+        assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
 
-        assertFalse(stored.unreadable)
-        assertEquals(VpnProfile().phase1Hash, stored.profile.phase1Hash)
-        assertEquals("vpn.example.com", stored.profile.server)
-        assertTrue(logged.toString(), logged.any { it.startsWith("WARN") && it.contains("SHA3_512") })
+        // Usable right now…
+        assertEquals(LEGACY_PROFILE_ID, fixture.store.profiles.value.single().id)
+        assertArrayEquals(
+            "s3cr3t-psk".toCharArray(),
+            fixture.reader.read(LEGACY_PROFILE_ID, SecretKind.PRESHARED_KEY),
+        )
+        // …and nothing was thrown away.
+        assertEquals("s3cr3t-psk", disk.values["psk"])
+        assertEquals("hunter2", disk.values["password"])
+        assertFalse(disk.values.containsKey(KEY_ORDER))
+
+        // The next start, on a store that works again, completes the move.
+        disk.writesFail = false
+        val restarted = StoreFixture(disk)
+        restarted.awaitLoaded()
+
+        assertEquals(LEGACY_PROFILE_ID, restarted.store.profiles.value.single().id)
+        assertArrayEquals(
+            "s3cr3t-psk".toCharArray(),
+            restarted.reader.read(LEGACY_PROFILE_ID, SecretKind.PRESHARED_KEY),
+        )
+        assertFalse("psk" in disk.values.keys)
+    }
+
+    /**
+     * A device whose keystore was broken kept its profile in the plaintext fallback file. If the
+     * keystore has since started working we open an empty encrypted store — and would silently
+     * lose the setup unless the old file is looked at once.
+     */
+    @Test
+    fun `a profile left in the plaintext fallback store is brought forward`() {
+        val encryptedDisk = FakePreferences()
+        val fallback = legacyPreferences()
+
+        val fixture = StoreFixture(encryptedDisk, legacy = fallback)
+        assertEquals(ProfileStoreState.READY, fixture.awaitLoaded())
+
+        assertEquals("Home", fixture.store.profiles.value.single().name)
+        assertArrayEquals(
+            "s3cr3t-psk".toCharArray(),
+            fixture.reader.read(LEGACY_PROFILE_ID, SecretKind.PRESHARED_KEY),
+        )
+        assertTrue("the new store holds it now", encryptedDisk.values.containsKey(KEY_ORDER))
+        assertFalse("and the plaintext copy is gone", "psk" in fallback.values.keys)
     }
 
     @Test
-    fun `a PPP auth list of only unknown names falls back to the default`() {
-        val prefs = FakePreferences(mapOf("ppp_auth" to "EAP_TLS,SPAP"))
+    fun `the fallback store is not consulted once the main one holds profiles`() {
+        val encryptedDisk = FakePreferences()
+        StoreFixture(encryptedDisk).let {
+            it.awaitLoaded()
+            it.upsert(work)
+        }
+        val fallback = legacyPreferences()
 
-        assertEquals(VpnProfile.DEFAULT_PPP_AUTH, readProfile(prefs, log).profile.allowedPppAuth)
-    }
-}
+        val fixture = StoreFixture(encryptedDisk, legacy = fallback)
+        fixture.awaitLoaded()
 
-/** Throws out of every read and every write, the way a store with the wrong keyset does. */
-private class ThrowingPreferences : SharedPreferences by FakePreferences() {
-    override fun getString(key: String?, defValue: String?): String =
-        throw SecurityException("Could not decrypt value")
-
-    override fun getInt(key: String?, defValue: Int): Int =
-        throw SecurityException("Could not decrypt value")
-
-    override fun getBoolean(key: String?, defValue: Boolean): Boolean =
-        throw SecurityException("Could not decrypt value")
-
-    override fun edit(): SharedPreferences.Editor =
-        throw SecurityException("Could not encrypt value")
-}
-
-/**
- * An in-memory [SharedPreferences]. [unreadableKeys] throw on read so a partial decryption failure
- * can be exercised.
- */
-private class FakePreferences(
-    initial: Map<String, Any> = emptyMap(),
-    private val unreadableKeys: Set<String> = emptySet(),
-) : SharedPreferences {
-
-    private val values = LinkedHashMap<String, Any>(initial)
-
-    private fun guard(key: String?) {
-        if (key in unreadableKeys) throw SecurityException("Could not decrypt value for $key")
+        assertEquals(listOf("work"), fixture.store.profiles.value.map { it.id })
+        assertEquals("s3cr3t-psk", fallback.values["psk"])
     }
 
-    override fun getAll(): MutableMap<String, *> = values
+    // ------------------------------------------------------------------ redaction
 
-    override fun getString(key: String?, defValue: String?): String? {
-        guard(key)
-        return values[key] as? String ?: defValue
+    @Test
+    fun `nothing the store logs contains a secret`() {
+        val disk = legacyPreferences()
+        val fixture = StoreFixture(disk)
+        fixture.awaitLoaded()
+        fixture.upsert(home)
+        fixture.secrets.store("home", SecretKind.PASSWORD, "another-password".toCharArray())
+        fixture.flushSecrets()
+        fixture.delete("home")
+
+        val text = fixture.logText()
+        assertFalse(text, text.contains("s3cr3t-psk"))
+        assertFalse(text, text.contains("hunter2"))
+        assertFalse(text, text.contains("another-password"))
     }
 
-    override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
-        guard(key)
-        @Suppress("UNCHECKED_CAST")
-        return values[key] as? MutableSet<String> ?: defValues
-    }
+    private fun legacyPreferences() = FakePreferences(legacyValues())
 
-    override fun getInt(key: String?, defValue: Int): Int {
-        guard(key)
-        return values[key] as? Int ?: defValue
-    }
-
-    override fun getLong(key: String?, defValue: Long): Long {
-        guard(key)
-        return values[key] as? Long ?: defValue
-    }
-
-    override fun getFloat(key: String?, defValue: Float): Float {
-        guard(key)
-        return values[key] as? Float ?: defValue
-    }
-
-    override fun getBoolean(key: String?, defValue: Boolean): Boolean {
-        guard(key)
-        return values[key] as? Boolean ?: defValue
-    }
-
-    override fun contains(key: String?): Boolean = values.containsKey(key)
-
-    override fun edit(): SharedPreferences.Editor = FakeEditor(values)
-
-    override fun registerOnSharedPreferenceChangeListener(
-        listener: SharedPreferences.OnSharedPreferenceChangeListener?,
-    ) = Unit
-
-    override fun unregisterOnSharedPreferenceChangeListener(
-        listener: SharedPreferences.OnSharedPreferenceChangeListener?,
-    ) = Unit
-}
-
-private class FakeEditor(private val target: MutableMap<String, Any>) : SharedPreferences.Editor {
-
-    private val staged = LinkedHashMap<String, Any?>()
-    private var clearRequested = false
-
-    override fun putString(key: String?, value: String?) = apply { staged[key!!] = value }
-
-    override fun putStringSet(key: String?, values: MutableSet<String>?) =
-        apply { staged[key!!] = values }
-
-    override fun putInt(key: String?, value: Int) = apply { staged[key!!] = value }
-    override fun putLong(key: String?, value: Long) = apply { staged[key!!] = value }
-    override fun putFloat(key: String?, value: Float) = apply { staged[key!!] = value }
-    override fun putBoolean(key: String?, value: Boolean) = apply { staged[key!!] = value }
-    override fun remove(key: String?) = apply { staged[key!!] = null }
-    override fun clear() = apply { clearRequested = true }
-
-    override fun commit(): Boolean {
-        if (clearRequested) target.clear()
-        staged.forEach { (key, value) -> if (value == null) target.remove(key) else target[key] = value }
-        return true
-    }
-
-    override fun apply() {
-        commit()
-    }
+    private fun legacyValues(): Map<String, Any> = mapOf(
+        "name" to "Home",
+        "server" to "vpn.example.com",
+        "psk" to "s3cr3t-psk",
+        "username" to "alice",
+        "password" to "hunter2",
+        "mtu" to 1380,
+    )
 }

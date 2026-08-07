@@ -49,6 +49,13 @@ class FakeIkeTransport(
     /** Every datagram the negotiator has sent, in order. */
     val sent = mutableListOf<ByteArray>()
 
+    /**
+     * Datagrams the negotiator handed back because they belong to another ISAKMP SA. A tunnel
+     * parks these until the rekey that is running finishes; here they are only recorded, so a test
+     * can tell "given back" from "silently dropped".
+     */
+    val deferred = mutableListOf<ByteArray>()
+
     /** Records outbound datagrams but never shows them to the responder, modelling a dead path. */
     var dropOutbound = false
 
@@ -76,6 +83,10 @@ class FakeIkeTransport(
     }
 
     override fun receiveIsakmp(timeoutMs: Int): ByteArray? = inbox.removeFirstOrNull()
+
+    override fun deferForeignMessage(message: ByteArray) {
+        deferred += message
+    }
 
     /** The first cleartext message whose header announces [payloadType] as its first payload. */
     fun firstCleartextMessageStartingWith(payloadType: Int): PayloadChain? = sent

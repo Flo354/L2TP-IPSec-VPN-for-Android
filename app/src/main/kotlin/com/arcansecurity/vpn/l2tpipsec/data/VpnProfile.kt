@@ -12,32 +12,44 @@ import com.arcansecurity.vpn.l2tpipsec.core.tunnel.Phase1Proposal
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.Phase2Proposal
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.PppAuthProtocol
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.VpnConfig
+import java.util.UUID
 
 /**
- * The user-editable half of a [VpnConfig].
+ * A saved connection: the user-editable, **non-secret** half of a [VpnConfig].
  *
  * [VpnConfig] carries a fair number of protocol timers that nobody should have to think about;
  * this class keeps only what a person configuring a road-warrior tunnel actually needs, in the
  * shape the UI edits it (free text for the DNS list, a nullable PFS group, …), and [toVpnConfig]
  * performs the translation.
  *
- * Every default here is the one that works against the target hardware: IKEv1 main mode,
+ * ## It deliberately holds no secret
+ *
+ * The pre-shared key and the PPP password used to be two more `String` fields here. That made them
+ * reachable from anything holding a profile — a text field, a `copy()`, a crash reporter walking
+ * the object graph — and the generated `toString` printed both. They now live in [SecretVault],
+ * which has no getter at all, and the only way back to a plaintext secret is [SecretReader.read].
+ * Keeping a secret out of this class is what makes that guarantee structural rather than a habit:
+ * there is nothing to leak because there is nothing here.
+ *
+ * Every default is the one that works against the target hardware: IKEv1 main mode,
  * `aes256-sha256-modp2048` for phase 1, `aes256-sha256` with no PFS for phase 2, forced UDP
  * encapsulation (Android cannot open raw ESP sockets) and an MTU of 1400.
  *
  * The class is deliberately free of Android types so that it can be unit-tested on a plain JVM.
  */
 data class VpnProfile(
+    /**
+     * Stable identity, generated once by [newId] and never reused — it keys this profile's rows in
+     * the preference store *and* its entries in [SecretVault], so recycling one would hand a new
+     * profile the previous tenant's credentials.
+     */
+    val id: String,
     /** Display name; also used as the `VpnService.Builder` session label. */
     val name: String = DEFAULT_NAME,
     /** Host name or literal IPv4 address of the VPN concentrator. */
     val server: String = "",
-    /** IKE pre-shared key. Stored encrypted, never logged. */
-    val presharedKey: String = "",
-    /** PPP user name. */
+    /** PPP user name. Not a secret: it is shown in the list and in the notification. */
     val username: String = "",
-    /** PPP password. Stored encrypted, never logged. */
-    val password: String = "",
 
     val exchangeMode: IkeExchangeMode = IkeExchangeMode.MAIN,
     /** ISAKMP identity type; [IkeIdentityType.AUTO_IPV4] derives it from the socket. */
@@ -87,17 +99,28 @@ data class VpnProfile(
             IkeIdentity(identityType, identityValue.trim())
         }
 
+    /** What the list and the notification show for a profile the user never named. */
+    val displayName: String get() = name.ifBlank { server.ifBlank { DEFAULT_NAME } }
+
     /**
-     * Translates this profile into the protocol stack's configuration.
+     * Translates this profile plus its two secrets into the protocol stack's configuration.
+     *
+     * The secrets are passed in rather than looked up: this class cannot reach [SecretVault], and
+     * the single place allowed to resolve them is [SecretReader]. Prefer [buildVpnConfig], which
+     * pairs the lookup with wiping the plaintext afterwards.
+     *
+     * Note that [VpnConfig] holds its two secrets as `String`, so from this call onwards they are
+     * immutable heap objects that cannot be wiped. Narrowing that is a change to `:core`, out of
+     * this layer's reach.
      *
      * @throws IllegalArgumentException if the profile is invalid; call [validate] first to get
      *   per-field diagnostics instead of an exception.
      */
-    fun toVpnConfig(): VpnConfig = VpnConfig(
+    fun toVpnConfig(presharedKey: CharArray, password: CharArray): VpnConfig = VpnConfig(
         serverHost = server.trim(),
-        presharedKey = presharedKey,
+        presharedKey = String(presharedKey),
         username = username.trim(),
-        password = password,
+        password = String(password),
         exchangeMode = exchangeMode,
         localIdentity = localIdentity,
         phase1 = Phase1Proposal(
@@ -118,9 +141,16 @@ data class VpnProfile(
         debugLogging = debugLogging,
     )
 
-    /** Never let a PSK or a password reach the log buffer. */
+    /**
+     * Written out by hand even though there is no secret left to hide.
+     *
+     * The generated `toString` of the old data class printed the pre-shared key and the password in
+     * full, which is how they reached the in-app log buffer. Keeping an explicit one means adding a
+     * secret to this class can no longer leak it by default: the field would simply not be printed,
+     * and [VpnProfileTest] fails the build if a secret-shaped property ever appears here at all.
+     */
     override fun toString(): String =
-        "VpnProfile(name=$name, server=$server, username=$username, psk=***, password=***, " +
+        "VpnProfile(id=$id, name=$name, server=$server, username=$username, " +
             "exchangeMode=$exchangeMode, identity=$localIdentity, " +
             "phase1=$phase1Encryption/$phase1Hash/$phase1DhGroup, " +
             "phase2=$phase2Encryption/$phase2Integrity/pfs=$phase2PfsGroup, " +
@@ -139,6 +169,40 @@ data class VpnProfile(
             PppAuthProtocol.PAP,
         )
 
+        /**
+         * A fresh identity for a profile the user is about to create.
+         *
+         * Random rather than sequential on purpose: an index would be reused the moment a profile
+         * in the middle of the list is deleted, and the next profile to take that index would
+         * inherit the deleted one's stored secrets.
+         */
+        fun newId(): String = UUID.randomUUID().toString()
+
+        /** An empty profile with a fresh [newId], for the "add a connection" flow. */
+        fun blank(name: String = DEFAULT_NAME): VpnProfile = VpnProfile(id = newId(), name = name)
+
         private val DNS_SEPARATORS = Regex("[,;\\s]+")
+    }
+}
+
+/**
+ * Resolves [profile]'s secrets and builds the protocol configuration, wiping the plaintext arrays
+ * before returning.
+ *
+ * This is the whole reason [SecretReader] exists as a separate type: the service is handed one, the
+ * UI never is, and this function is the only caller in the app that turns a stored secret back into
+ * something readable.
+ *
+ * @throws IllegalArgumentException if the profile is incomplete — `VpnConfig` rejects an empty
+ *   server or pre-shared key. Call [validate] first for per-field diagnostics.
+ */
+fun buildVpnConfig(profile: VpnProfile, secrets: SecretReader): VpnConfig {
+    val psk = secrets.read(profile.id, SecretKind.PRESHARED_KEY) ?: CharArray(0)
+    val password = secrets.read(profile.id, SecretKind.PASSWORD) ?: CharArray(0)
+    try {
+        return profile.toVpnConfig(psk, password)
+    } finally {
+        psk.wipe()
+        password.wipe()
     }
 }

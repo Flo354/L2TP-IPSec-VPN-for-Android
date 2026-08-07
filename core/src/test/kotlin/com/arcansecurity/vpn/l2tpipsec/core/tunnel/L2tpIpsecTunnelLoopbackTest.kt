@@ -2,7 +2,10 @@ package com.arcansecurity.vpn.l2tpipsec.core.tunnel
 
 import com.arcansecurity.vpn.l2tpipsec.core.e2e.FakeTun
 import com.arcansecurity.vpn.l2tpipsec.core.e2e.FakeTunProvider
+import com.arcansecurity.vpn.l2tpipsec.core.ike.FakeIkeResponder
+import com.arcansecurity.vpn.l2tpipsec.core.ike.NotifyType
 import com.arcansecurity.vpn.l2tpipsec.core.l2tp.L2tpMessageType
+import com.arcansecurity.vpn.l2tpipsec.core.util.ByteReader
 import com.arcansecurity.vpn.l2tpipsec.core.util.VpnLogger
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -250,7 +253,101 @@ class L2tpIpsecTunnelLoopbackTest {
         )
     }
 
+    /**
+     * A phase-1 rekey runs a whole Main Mode on the maintenance thread, and that thread is the only
+     * consumer of the inbound ISAKMP queue — so for the length of the rekey the *new* negotiator is
+     * the one draining it, and a DPD probe for the still-live old SA is addressed to cookies it does
+     * not have and encrypted under keys it cannot derive. A peer that hears nothing back for the few
+     * round trips a Main Mode takes concludes the tunnel is dead and tears it down.
+     */
+    @Test
+    fun `a dpd probe for the old sa sent during a phase 1 rekey is still answered`() {
+        val server = FakeVpnServer(PSK, ppp = peer())
+        val (tunnel, recorder, _) = start(server)
+
+        server.duringPhase1Rekey = { old -> listOf(old.buildDpdRequest(DPD_SEQUENCE)) }
+        server.sendIsakmpDelete()
+
+        val old = awaitSupersededSa(server)
+        // Reaching the old responder at all is the proof the answer was authenticated with the old
+        // SA's keys: it is keyed for that SA alone and would not decode anything else.
+        await("the DPD probe sent during the rekey was never acknowledged") {
+            old.receivedNotifyTypes.contains(NotifyType.DPD_R_U_THERE_ACK)
+        }
+        val ack = old.receivedNotifies.first { it.notifyType == NotifyType.DPD_R_U_THERE_ACK }
+        assertEquals(
+            "the acknowledgement must echo the sequence of the probe it answers",
+            DPD_SEQUENCE.toLong(),
+            ByteReader(ack.data).u32(),
+        )
+        assertEquals("the tunnel died during the rekey: ${recorder.message}", null, recorder.kind)
+        assertEquals(1L, tunnel.stats.ikeRekeys)
+    }
+
+    /**
+     * The same window, with a Delete in it. Losing it leaves the client encrypting into an IPsec SA
+     * the peer has already thrown away, which looks exactly like a tunnel that is up and carrying
+     * nothing.
+     */
+    @Test
+    fun `an ipsec delete that arrives during a phase 1 rekey is not lost`() {
+        val server = FakeVpnServer(PSK, ppp = peer())
+        val (tunnel, recorder, _) = start(server)
+
+        // A Delete names the sender's own inbound SPIs, which are the ones we send on.
+        server.duringPhase1Rekey = { old -> listOf(old.buildEspDelete(old.inboundSpi)) }
+        server.sendIsakmpDelete()
+
+        await("the delete was dropped: the IPsec SA the peer retired was never replaced") {
+            tunnel.stats.ipsecRekeys >= 1
+        }
+        assertEquals("the tunnel died during the rekey: ${recorder.message}", null, recorder.kind)
+        assertEquals(1L, tunnel.stats.ikeRekeys)
+    }
+
+    /**
+     * And with a Quick Mode in it. It arrives on the superseded ISAKMP SA, so only that SA's
+     * negotiator can answer it — and both ends have to end up on the same ESP pair, or the tunnel
+     * goes quiet without ever reporting a failure.
+     */
+    @Test
+    fun `a peer initiated quick mode that arrives during a phase 1 rekey is answered`() {
+        val server = FakeVpnServer(PSK, ppp = peer())
+        val (tunnel, recorder, provider) = start(server)
+
+        server.duringPhase1Rekey = { old -> listOf(old.startQuickMode()) }
+        server.sendIsakmpDelete()
+
+        await("the quick mode the peer started during the rekey went unanswered") {
+            tunnel.stats.ipsecRekeys >= 1
+        }
+        assertEquals("the tunnel died during the rekey: ${recorder.message}", null, recorder.kind)
+        assertEquals(1L, tunnel.stats.ikeRekeys)
+
+        val tun = provider.established!!
+        val packet = ipPacket(23)
+        tun.inject(packet)
+        val echoed = tun.awaitInbound(10_000)
+        assertNotNull("the two ends did not agree on the SA the peer negotiated", echoed)
+        assertTrue(packet.contentEquals(echoed!!))
+    }
+
     // ------------------------------------------------------------------------------- helpers
+
+    private fun await(message: String, timeoutMs: Long = 25_000, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (condition()) return
+            Thread.sleep(50)
+        }
+        throw AssertionError(message)
+    }
+
+    /** The server's view of the ISAKMP SA the client has started replacing. */
+    private fun awaitSupersededSa(server: FakeVpnServer): FakeIkeResponder {
+        await("the client never started renegotiating phase 1") { server.supersededResponder != null }
+        return server.supersededResponder!!
+    }
 
     private fun peer(primaryDns: String = "10.10.10.1", secondaryDns: String = "8.8.8.8") =
         PppPeer(
@@ -294,5 +391,6 @@ class L2tpIpsecTunnelLoopbackTest {
         const val PSK = "correct horse battery staple"
         const val THREAD_PREFIX = "l2tp-vpn-"
         const val PACKETS = 2_000
+        const val DPD_SEQUENCE = 0x00ABCDEF
     }
 }

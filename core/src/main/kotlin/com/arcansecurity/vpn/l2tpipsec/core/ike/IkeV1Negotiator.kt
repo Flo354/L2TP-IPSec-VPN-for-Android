@@ -503,6 +503,14 @@ class IkeV1Negotiator(
                 log.w("dropping a malformed datagram while awaiting HASH(3): ${e.message}")
                 continue
             }
+            // The same overlap as during a rekey, the other way round: a peer-initiated Quick Mode
+            // on the SA a rekey has just superseded is answered by *its* negotiator, so anything
+            // arriving here for the SA that replaced it would be measured against the wrong keys.
+            if (!header.initiatorCookie.contentEquals(initiatorCookie)) {
+                log.d { "handing back an ISAKMP message for another SA while awaiting HASH(3)" }
+                transport.deferForeignMessage(raw)
+                continue
+            }
             if (header.exchangeType == ExchangeType.INFORMATIONAL) {
                 processInformational(raw)
                 continue
@@ -852,7 +860,10 @@ class IkeV1Negotiator(
                     continue
                 }
                 if (!header.initiatorCookie.contentEquals(initiatorCookie)) {
-                    log.w("dropping an ISAKMP message addressed to another initiator cookie")
+                    // Routine during a phase-1 rekey: this negotiator shares its inbound stream
+                    // with the SA it is replacing, which is still live and still being talked to.
+                    log.d { "handing back an ISAKMP message addressed to another initiator cookie" }
+                    transport.deferForeignMessage(raw)
                     continue
                 }
                 if (header.exchangeType == ExchangeType.INFORMATIONAL) {

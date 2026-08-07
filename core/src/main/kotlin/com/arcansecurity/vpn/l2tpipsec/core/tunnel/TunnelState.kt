@@ -58,6 +58,14 @@ enum class TunnelErrorKind {
     INTERNAL,
 }
 
+/**
+ * A categorised failure.
+ *
+ * [message] travels furthest of anything this module produces: the app renders it on the status
+ * card, logs it, and lets the user copy or share that log. It must therefore describe *what*
+ * failed — a rejected proposal, a refused password — and never quote the credential involved. Use
+ * [com.arcansecurity.vpn.l2tpipsec.core.util.redacted] if a value has to be mentioned at all.
+ */
 class TunnelException(
     val kind: TunnelErrorKind,
     message: String,

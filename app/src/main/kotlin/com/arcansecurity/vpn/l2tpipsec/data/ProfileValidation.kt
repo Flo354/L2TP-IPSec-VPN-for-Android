@@ -36,12 +36,40 @@ data class ValidationResult(val errors: List<ValidationError> = emptyList()) {
 }
 
 /**
+ * Which of a profile's secrets exist — the *only* thing validation is allowed to know about them.
+ *
+ * "The pre-shared key is required" used to be `presharedKey.isEmpty()`, which forced the value to
+ * be reachable from the profile. Existence is all the rule ever needed, and it is exactly what
+ * [SecretVault.isSet] answers.
+ *
+ * The UI builds this from the vault plus whatever the user has typed but not stored yet: a form
+ * with a freshly typed key is valid before the vault has seen it.
+ */
+data class SecretPresence(
+    val presharedKeySet: Boolean,
+    val passwordSet: Boolean,
+) {
+    companion object {
+        val NONE = SecretPresence(presharedKeySet = false, passwordSet = false)
+
+        /** What [vault] currently holds for [profileId]. */
+        fun of(vault: SecretVault, profileId: String): SecretPresence = SecretPresence(
+            presharedKeySet = vault.isSet(profileId, SecretKind.PRESHARED_KEY),
+            passwordSet = vault.isSet(profileId, SecretKind.PASSWORD),
+        )
+    }
+}
+
+/**
  * Checks the profile before it is handed to the protocol stack.
  *
  * The rules mirror the `require` blocks inside `VpnConfig` so that the UI can explain the problem
  * next to the offending field instead of letting the constructor throw.
+ *
+ * The PPP password is deliberately *not* required: plenty of concentrators are configured with an
+ * empty one, and `VpnConfig` does not insist either.
  */
-fun VpnProfile.validate(): ValidationResult {
+fun VpnProfile.validate(secrets: SecretPresence): ValidationResult {
     val errors = mutableListOf<ValidationError>()
 
     val host = server.trim()
@@ -56,7 +84,7 @@ fun VpnProfile.validate(): ValidationResult {
             errors += ValidationError(ProfileField.SERVER, "Not a valid host name or IP address")
     }
 
-    if (presharedKey.isEmpty()) {
+    if (!secrets.presharedKeySet) {
         errors += ValidationError(ProfileField.PRESHARED_KEY, "Pre-shared key is required")
     }
 
@@ -88,6 +116,10 @@ fun VpnProfile.validate(): ValidationResult {
 
     return ValidationResult(errors)
 }
+
+/** [validate] against what [vault] holds for this profile right now. */
+fun VpnProfile.validate(vault: SecretVault): ValidationResult =
+    validate(SecretPresence.of(vault, id))
 
 /** Host names, IPv4 literals; deliberately permissive, the resolver has the final word. */
 private val HOST_PATTERN = Regex("^[A-Za-z0-9._:\\[\\]-]+$")
