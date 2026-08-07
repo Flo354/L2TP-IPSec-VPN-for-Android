@@ -76,8 +76,8 @@ object NotifyType {
     const val PAYLOAD_MALFORMED = 16
     const val INVALID_KEY_INFORMATION = 17
     const val INVALID_ID_INFORMATION = 18
-    const val AUTHENTICATION_FAILED = 24
     const val INVALID_HASH_INFORMATION = 23
+    const val AUTHENTICATION_FAILED = 24
     const val CONNECTED = 16384
     const val INITIAL_CONTACT = 24578
     /** RFC 3706 dead peer detection. */

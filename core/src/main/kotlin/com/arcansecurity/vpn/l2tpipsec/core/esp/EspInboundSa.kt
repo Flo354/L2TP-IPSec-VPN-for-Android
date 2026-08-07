@@ -68,9 +68,15 @@ class EspInboundSa(
      * The order matters and follows RFC 4303 section 3.4.4: the ICV is checked *first* and in
      * constant time, so a forged packet can neither advance the replay window nor reach the
      * cipher. Only the length and the SPI - the demultiplexing fields, which carry no secret - are
-     * looked at before it. Every failure raises [EspException] and bumps [packetsDropped]; the
-     * message names the failing check for the log, but nothing observable from the network
-     * distinguishes a bad ICV from a bad plaintext, because a bad ICV never reaches the cipher.
+     * looked at before it.
+     *
+     * That ordering is what closes the padding oracle. Reaching the cipher at all takes a valid
+     * ICV, which takes the integrity key, so an attacker never gets to tell a well-padded
+     * plaintext from a badly padded one: everything they can produce fails the same comparison,
+     * over the same number of bytes, before any of the decrypt path runs.
+     *
+     * Every failure raises [EspException] and bumps [packetsDropped]. The message names the
+     * failing check, for the log only.
      */
     fun decapsulate(packet: ByteArray, offset: Int = 0, length: Int = packet.size - offset): Decapsulated {
         try {
@@ -91,8 +97,10 @@ class EspInboundSa(
     private fun decapsulateOrThrow(packet: ByteArray, offset: Int, length: Int): Decapsulated {
         val blockBytes = encryption.blockBytes
         val icvBytes = integrity.icvBytes
-        if (offset < 0 || length < 0 || offset + length > packet.size) {
-            throw EspException("ESP range $offset..${offset + length} outside a ${packet.size}-byte buffer")
+        // A subtraction, not a sum: `offset + length` can overflow an `Int` and a wrapped
+        // comparison would let a range that is not in the buffer through to the MAC and the cipher.
+        if (offset < 0 || length < 0 || length > packet.size - offset) {
+            throw EspException("ESP range of $length bytes at $offset outside a ${packet.size}-byte buffer")
         }
         // Header + IV + at least one ciphertext block + ICV.
         val minimum = EspLayout.HEADER_SIZE + blockBytes + blockBytes + icvBytes

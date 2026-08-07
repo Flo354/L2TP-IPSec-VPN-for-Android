@@ -8,6 +8,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -108,6 +109,14 @@ class PppSessionTest {
     }
 
     @Test
+    fun `a session with no usable configuration is refused up front`() {
+        // Both would otherwise surface much later, as a NoSuchElementException or an
+        // IllegalArgumentException thrown out of the packet pump halfway through LCP.
+        assertThrows(IllegalArgumentException::class.java) { RecordingSession(allowedAuth = emptyList()) }
+        assertThrows(IllegalArgumentException::class.java) { RecordingSession(requestedMru = 64) }
+    }
+
+    @Test
     fun `unknown and unimplemented lcp options are configure rejected`() {
         val client = RecordingSession()
         client.start()
@@ -185,6 +194,53 @@ class PppSessionTest {
         assertEquals("0500", Bytes.toHex(second.options().first { it.type == LcpOption.MRU }.value))
         // A retransmission must not reuse the identifier of a request the peer already answered.
         assertTrue(second.identifier != first.identifier)
+    }
+
+    @Test
+    fun `a naked magic number is replaced with a fresh one rather than the peer's suggestion`() {
+        val client = RecordingSession()
+        client.start()
+        val first = client.last(PppProtocol.LCP, PppCode.CONFIGURE_REQUEST)
+        val peerMagic = Bytes.fromHex("0badf00d")
+
+        client.deliverOptions(
+            PppProtocol.LCP, PppCode.CONFIGURE_NAK, first.identifier,
+            listOf(PppOption(LcpOption.MAGIC_NUMBER, peerMagic)),
+        )
+
+        val ourMagic = client.last(PppProtocol.LCP, PppCode.CONFIGURE_REQUEST)
+            .options().first { it.type == LcpOption.MAGIC_NUMBER }.value
+        assertFalse("adopting the value the peer suggested invites a false loopback", ourMagic.contentEquals(peerMagic))
+
+        // The peer now uses the number it proposed; that must not read as a looped-back line.
+        client.deliverOptions(
+            PppProtocol.LCP, PppCode.CONFIGURE_REQUEST, 1,
+            listOf(PppOption(LcpOption.MAGIC_NUMBER, peerMagic)),
+        )
+        assertNull(client.session.failure?.message, client.session.failure)
+    }
+
+    @Test
+    fun `an lcp option the peer keeps naking is eventually dropped`() {
+        val client = RecordingSession(requestedMru = 1400)
+        client.start()
+
+        // 1500 is above what we asked for, so the coercion hands back 1400 every time and the
+        // exchange can never converge on its own.
+        repeat(20) {
+            val request = client.last(PppProtocol.LCP, PppCode.CONFIGURE_REQUEST)
+            client.deliverOptions(
+                PppProtocol.LCP, PppCode.CONFIGURE_NAK, request.identifier,
+                listOf(PppOption(LcpOption.MRU, Bytes.fromHex("05dc"))),
+            )
+        }
+
+        val requests = client.of(PppProtocol.LCP, PppCode.CONFIGURE_REQUEST)
+        assertTrue("the Nak loop is unbounded: ${requests.size} Configure-Requests", requests.size <= 8)
+        assertTrue(
+            "the option the peer keeps naking must be dropped",
+            requests.last().options().none { it.type == LcpOption.MRU },
+        )
     }
 
     @Test
@@ -361,6 +417,95 @@ class PppSessionTest {
     }
 
     @Test
+    fun `a repeated ms-chapv2 challenge is answered with the very same response`() {
+        val client = RecordingSession(username = "User", password = "clientPass")
+        client.openLcp(PppAuthProtocol.MSCHAP_V2)
+        val authenticatorChallenge = Bytes.fromHex("5b5d7c7d7b3f2f3e3c2c602132262628")
+        val challenge = PppControlPacket(ChapCode.CHALLENGE, 1, ChapPacket.encode(authenticatorChallenge, "lns"))
+
+        client.deliver(PppProtocol.CHAP, challenge)
+        val first = client.lastOf(PppProtocol.CHAP)
+        client.deliver(PppProtocol.CHAP, challenge)
+        val second = client.lastOf(PppProtocol.CHAP)
+
+        assertEquals("a retransmitted challenge must not draw a new peer challenge", first, second)
+
+        // The authenticator computed its Success over the response it received first; picking a new
+        // peer challenge for the retransmission would make that Success fail to verify.
+        val value = first.data.copyOfRange(1, 1 + MsChapV2.RESPONSE_SIZE)
+        val authenticatorResponse = MsChapV2.generateAuthenticatorResponse(
+            "clientPass",
+            value.copyOfRange(24, 48),
+            value.copyOfRange(0, 16),
+            authenticatorChallenge,
+            "User",
+        )
+        client.deliver(
+            PppProtocol.CHAP,
+            PppControlPacket(ChapCode.SUCCESS, 1, "$authenticatorResponse M=Welcome".toByteArray()),
+        )
+        assertNull(client.session.failure?.message, client.session.failure)
+        assertEquals(PppSession.Phase.NETWORK, client.phase)
+    }
+
+    @Test
+    fun `an authentication that finishes before lcp opens still reaches the network phase`() {
+        val client = RecordingSession(username = "User", password = "clientPass")
+        client.start()
+        val ourRequest = client.last(PppProtocol.LCP, PppCode.CONFIGURE_REQUEST)
+
+        // The peer has acknowledged our request and had its own acknowledged, so it considers LCP
+        // open and challenges us. Its Configure-Ack is simply still on the wire, or was lost and is
+        // waiting on its restart timer.
+        client.deliverOptions(
+            PppProtocol.LCP, PppCode.CONFIGURE_REQUEST, 1,
+            listOf(
+                PppOption(LcpOption.MRU, Bytes.fromHex("0578")),
+                PppOption(LcpOption.AUTH_PROTOCOL, PppAuthProtocol.MSCHAP_V2.authOptionValue()),
+                PppOption(LcpOption.MAGIC_NUMBER, Bytes.fromHex("0badf00d")),
+            ),
+        )
+        assertEquals(PppSession.Phase.ESTABLISH, client.phase)
+
+        val authenticatorChallenge = Bytes.fromHex("5b5d7c7d7b3f2f3e3c2c602132262628")
+        client.deliver(
+            PppProtocol.CHAP,
+            PppControlPacket(ChapCode.CHALLENGE, 1, ChapPacket.encode(authenticatorChallenge, "lns")),
+        )
+        val value = client.lastOf(PppProtocol.CHAP).data.copyOfRange(1, 1 + MsChapV2.RESPONSE_SIZE)
+        val authenticatorResponse = MsChapV2.generateAuthenticatorResponse(
+            "clientPass",
+            value.copyOfRange(24, 48),
+            value.copyOfRange(0, 16),
+            authenticatorChallenge,
+            "User",
+        )
+        client.deliver(
+            PppProtocol.CHAP,
+            PppControlPacket(ChapCode.SUCCESS, 1, "$authenticatorResponse M=Welcome".toByteArray()),
+        )
+
+        // Only now does the acknowledgement of our own Configure-Request turn up.
+        client.deliver(PppProtocol.LCP, PppControlPacket(PppCode.CONFIGURE_ACK, ourRequest.identifier, ourRequest.data))
+
+        assertNull(client.session.failure?.message, client.session.failure)
+        assertEquals(PppSession.Phase.NETWORK, client.phase)
+        assertEquals(1, client.of(PppProtocol.IPCP, PppCode.CONFIGURE_REQUEST).size)
+    }
+
+    @Test
+    fun `a chap success is ignored when pap was negotiated`() {
+        val client = RecordingSession(allowedAuth = listOf(PppAuthProtocol.PAP))
+        client.openLcp(PppAuthProtocol.PAP)
+        assertEquals(PppSession.Phase.AUTHENTICATE, client.phase)
+
+        client.deliver(PppProtocol.CHAP, PppControlPacket(ChapCode.SUCCESS, 1, "Welcome".toByteArray()))
+
+        assertEquals("a CHAP Success proves nothing when PAP was negotiated", PppSession.Phase.AUTHENTICATE, client.phase)
+        assertTrue(client.of(PppProtocol.IPCP, PppCode.CONFIGURE_REQUEST).isEmpty())
+    }
+
+    @Test
     fun `an ms-chapv2 success without an s value is refused`() {
         val client = RecordingSession(username = "User", password = "clientPass")
         client.openLcp(PppAuthProtocol.MSCHAP_V2)
@@ -377,6 +522,47 @@ class PppSessionTest {
         )
         assertEquals(PppSession.Phase.FAILED, client.phase)
         assertEquals(TunnelErrorKind.PPP_AUTH_FAILED, client.session.failure!!.kind)
+    }
+
+    @Test
+    fun `a damaged ms-chapv2 authenticator response fails authentication instead of throwing`() {
+        val damaged = listOf(
+            "" to "an empty Success",
+            "M=Welcome" to "no S= field at all",
+            "S=407A5589115FD0D6209F510FE9C0456 M=Welcome" to "an S= field one digit short",
+            "S=" + "zz".repeat(20) to "an S= field that is not hex",
+            "S=407A5589115FD0D6209F510FE9C0456  M=x" to "an S= field padded with NUL",
+            // Char.isDigit accepts every Unicode digit while hex parsing only speaks ASCII, so an
+            // Arabic-Indic S= field is the one that used to throw out of the packet pump.
+            "S=" + "٣".repeat(40) + " M=Welcome" to "an S= field of non-ASCII digits",
+        )
+        for ((message, what) in damaged) {
+            val client = RecordingSession(username = "User", password = "clientPass")
+            client.openLcp(PppAuthProtocol.MSCHAP_V2)
+            client.deliver(
+                PppProtocol.CHAP,
+                PppControlPacket(
+                    ChapCode.CHALLENGE, 1,
+                    ChapPacket.encode(Bytes.fromHex("5b5d7c7d7b3f2f3e3c2c602132262628"), "lns"),
+                ),
+            )
+
+            client.deliver(PppProtocol.CHAP, PppControlPacket(ChapCode.SUCCESS, 1, message.toByteArray()))
+
+            assertEquals(what, PppSession.Phase.FAILED, client.phase)
+            assertEquals(what, TunnelErrorKind.PPP_AUTH_FAILED, client.session.failure!!.kind)
+        }
+    }
+
+    @Test
+    fun `an ms-chapv2 error code is only read from ascii digits`() {
+        assertEquals(691, parseMsChapErrorCode("E=691 R=1 V=3 M=Authentication failure"))
+        assertEquals(-1, parseMsChapErrorCode("R=1 V=3"))
+        assertEquals(-1, parseMsChapErrorCode("E= R=1"))
+        // Char.isDigit would take these for digits and turn them into nonsense error numbers.
+        assertEquals(-1, parseMsChapErrorCode("E=٣٩١"))
+        // A digit run long enough to overflow a 32-bit accumulator must not wrap into a real code.
+        assertEquals(-1, parseMsChapErrorCode("E=99999999999999999999"))
     }
 
     // ------------------------------------------------------------------ timers
@@ -564,6 +750,51 @@ class PppSessionTest {
             listOf(PppOption(IpcpOption.IP_ADDRESS, Bytes.ipv4ToBytes("10.10.10.1"))),
             ack.options(),
         )
+    }
+
+    @Test
+    fun `an ipcp option the peer keeps naking is eventually dropped`() {
+        val client = RecordingSession()
+        client.openLcp()
+
+        // A server with no secondary resolver configured naks the option with 0.0.0.0, which is
+        // exactly the value we already asked for, so nothing ever changes.
+        repeat(20) {
+            val request = client.last(PppProtocol.IPCP, PppCode.CONFIGURE_REQUEST)
+            client.deliverOptions(
+                PppProtocol.IPCP, PppCode.CONFIGURE_NAK, request.identifier,
+                listOf(PppOption(IpcpOption.SECONDARY_DNS, ByteArray(4))),
+            )
+        }
+
+        val requests = client.of(PppProtocol.IPCP, PppCode.CONFIGURE_REQUEST)
+        assertTrue("the Nak loop is unbounded: ${requests.size} Configure-Requests", requests.size <= 8)
+        assertTrue(
+            "the option the peer keeps naking must be dropped",
+            requests.last().options().none { it.type == IpcpOption.SECONDARY_DNS },
+        )
+    }
+
+    @Test
+    fun `a protocol reject is truncated to the mru the peer advertised`() {
+        val client = RecordingSession(requestedMru = 1400)
+        client.openLcp(peerMru = 300)
+
+        client.session.onFrame(PppProtocol.IPV6CP, ByteArray(1200) { 0x41 })
+
+        // RFC 1661 section 5.7: the Rejected-Information is truncated to the peer's MRU, not ours,
+        // otherwise the peer drops the very packet that tells it we do not speak the protocol.
+        assertEquals(300, client.last(PppProtocol.LCP, PppCode.PROTOCOL_REJECT).encode().size)
+    }
+
+    @Test
+    fun `a code reject is truncated to the mru the peer advertised`() {
+        val client = RecordingSession(requestedMru = 1400)
+        client.openLcp(peerMru = 300)
+
+        client.deliver(PppProtocol.LCP, PppControlPacket(200, 3, ByteArray(1200) { 0x41 }))
+
+        assertEquals(300, client.last(PppProtocol.LCP, PppCode.CODE_REJECT).encode().size)
     }
 
     @Test

@@ -43,6 +43,8 @@ data class TunnelStats(
 /** Categorised failures so the UI can give the user something actionable. */
 enum class TunnelErrorKind {
     DNS_FAILURE,
+
+    /** The socket itself would not carry the traffic: no route, no network, port unreachable. */
     NETWORK_UNREACHABLE,
     IKE_NO_RESPONSE,
     IKE_PROPOSAL_REJECTED,

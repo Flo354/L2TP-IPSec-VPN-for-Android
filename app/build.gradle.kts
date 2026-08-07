@@ -35,6 +35,13 @@ android {
         compose = true
     }
 
+    lint {
+        // Queries Maven Central on every run, so it turns a reproducible build into a
+        // network-dependent one and reports upgrades this project does not control: AGP 9 supplies
+        // Kotlin for Android modules itself, and the version it flags is shared with :core.
+        disable += "NewerVersionAvailable"
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"

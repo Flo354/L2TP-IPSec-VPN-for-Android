@@ -107,7 +107,9 @@ class L2tpTunnel(
                 // Version 1, revision 0: the only value L2TPv2 defines (RFC 2661 section 4.4.3).
                 L2tpAvp.u16(L2tpAvpType.ProtocolVersion, 0x0100),
                 L2tpAvp.text(L2tpAvpType.HostName, hostName),
-                // Bit 0 async, bit 1 sync: claim both so the LNS never rejects us on framing.
+                // RFC 2661 section 4.4.5 numbers from the most significant bit: A (async framing)
+                // is bit 30 and S (sync framing) bit 31, so 3 claims both and the LNS can never
+                // reject us on framing.
                 L2tpAvp.u32(L2tpAvpType.FramingCapabilities, 0x0000_0003),
                 L2tpAvp.u32(L2tpAvpType.BearerCapabilities, 0x0000_0003),
                 L2tpAvp.u16(L2tpAvpType.FirmwareRevision, 0x0001, mandatory = false),
@@ -400,6 +402,12 @@ class L2tpTunnel(
             return ControlOutcome.Consumed
         }
         log.d { "<- $type ns=${header.ns} nr=${header.nr}" }
+        // RFC 2661 section 4.2 says an unrecognised AVP with the M bit set must bring the tunnel
+        // down. Liveboxes emit mandatory AVPs that are not in the RFC, and losing the connection
+        // over one is worse for the user than ignoring it, so it only leaves a trace.
+        for (avp in avps) {
+            if (avp.mandatory && avp.avpType == null) log.w("ignoring an unknown mandatory AVP in $type: $avp")
+        }
 
         return when (type) {
             L2tpMessageType.StopCCN -> {
@@ -430,6 +438,14 @@ class L2tpTunnel(
 
     /** Drops every message the peer's Nr covers; sequence numbers are 16-bit and wrap. */
     private fun processAck(peerNr: Int) {
+        // Nr is the next Ns the peer expects, so it can never run past the next one we will send.
+        // Anything beyond that is a peer bug or a very old duplicate whose Nr has drifted more than
+        // half the sequence space away, and honouring it would retire messages the peer never saw:
+        // they would then never be retransmitted and the exchange would stall until the deadline.
+        if (peerNr != ns && !seqBefore(peerNr, ns)) {
+            log.w("ignoring an acknowledgement of nr=$peerNr; we have only sent up to ns=${(ns - 1) and SEQ_MASK}")
+            return
+        }
         while (true) {
             val head = unacked.firstOrNull() ?: return
             if (!seqBefore(head.ns, peerNr)) return

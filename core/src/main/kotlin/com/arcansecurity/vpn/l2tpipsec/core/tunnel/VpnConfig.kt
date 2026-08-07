@@ -97,6 +97,12 @@ data class VpnConfig(
     val natKeepaliveIntervalMs: Int = 20_000,
     /** L2TP HELLO period; also doubles as a liveness probe for the whole tunnel. */
     val l2tpHelloIntervalMs: Int = 60_000,
+    /**
+     * Carried here so a saved profile keeps it, but nothing in this module reads it: the stack
+     * always emits at every level and the [com.arcansecurity.vpn.l2tpipsec.core.util.VpnLogger]
+     * the host injects decides what to keep. The Android service reads this flag and sets its
+     * sink's threshold accordingly.
+     */
     val debugLogging: Boolean = false,
 ) {
     init {

@@ -2,16 +2,6 @@ package com.arcansecurity.vpn.l2tpipsec.data
 
 import android.content.Context
 import android.content.SharedPreferences
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
-import com.arcansecurity.vpn.l2tpipsec.core.crypto.DhGroup
-import com.arcansecurity.vpn.l2tpipsec.core.crypto.EspEncryption
-import com.arcansecurity.vpn.l2tpipsec.core.crypto.EspIntegrity
-import com.arcansecurity.vpn.l2tpipsec.core.crypto.IkeEncryption
-import com.arcansecurity.vpn.l2tpipsec.core.crypto.IkeHash
-import com.arcansecurity.vpn.l2tpipsec.core.tunnel.IkeExchangeMode
-import com.arcansecurity.vpn.l2tpipsec.core.tunnel.IkeIdentityType
-import com.arcansecurity.vpn.l2tpipsec.core.tunnel.PppAuthProtocol
 import com.arcansecurity.vpn.l2tpipsec.core.util.Log
 import com.arcansecurity.vpn.l2tpipsec.core.util.VpnLogger
 import com.arcansecurity.vpn.l2tpipsec.platform.AndroidLogger
@@ -22,11 +12,14 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * Persists the single VPN profile.
  *
- * The profile holds a pre-shared key and a PPP password, so it is written to
- * [EncryptedSharedPreferences] backed by an AES-256-GCM master key in the Android keystore. Some
- * devices — usually ones with a broken or wiped keystore — fail to initialise that; rather than
- * making the app unusable we fall back to plain preferences and say so loudly in the log, and
- * [usesEncryptedStorage] lets the UI warn the user.
+ * The profile holds a pre-shared key and a PPP password, so it is written to the keystore-backed
+ * store [openEncryptedPreferences] returns. Two things can go wrong with that, and neither may take
+ * the app down, because the only screen that could fix either is the one that would fail to open:
+ *
+ *  * the store cannot be created at all — a broken or wiped keystore. We fall back to plain
+ *    preferences, say so loudly in the log, and [usesEncryptedStorage] lets the UI warn the user;
+ *  * the store opens but its contents no longer decrypt. [readProfile] turns that into a blank
+ *    profile and raises [profileWasUnreadable].
  */
 class ProfileRepository private constructor(
     context: Context,
@@ -36,27 +29,26 @@ class ProfileRepository private constructor(
     private val log = Log(TAG, logger)
 
     private val prefs: SharedPreferences
+
     /** `false` when the keystore refused to give us an encrypted store. */
     val usesEncryptedStorage: Boolean
 
     private val _profile: MutableStateFlow<VpnProfile>
+    private val _profileWasUnreadable = MutableStateFlow(false)
 
     /** The persisted profile; updated on every [save]. */
     val profile: StateFlow<VpnProfile> get() = _profile.asStateFlow()
 
+    /**
+     * `true` when what was on disk could not be decrypted and [profile] is a blank one. The user has
+     * to be told: their profile is gone and nothing they do on screen will bring it back.
+     */
+    val profileWasUnreadable: StateFlow<Boolean> get() = _profileWasUnreadable.asStateFlow()
+
     init {
         var encrypted = true
         val store = try {
-            val masterKey = MasterKey.Builder(context.applicationContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                context.applicationContext,
-                ENCRYPTED_FILE,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
+            openEncryptedPreferences(context, ENCRYPTED_FILE)
         } catch (e: Throwable) {
             encrypted = false
             log.w(
@@ -68,87 +60,29 @@ class ProfileRepository private constructor(
         }
         prefs = store
         usesEncryptedStorage = encrypted
-        _profile = MutableStateFlow(read())
+
+        val stored = readProfile(prefs, log)
+        _profile = MutableStateFlow(stored.profile)
+        _profileWasUnreadable.value = stored.unreadable
     }
 
     /** Re-reads the store, discarding anything held in memory. */
     fun reload() {
-        _profile.value = read()
+        val stored = readProfile(prefs, log)
+        _profile.value = stored.profile
+        _profileWasUnreadable.value = stored.unreadable
     }
 
     /** Writes [profile] and publishes it to [ProfileRepository.profile]. */
     fun save(profile: VpnProfile) {
-        prefs.edit().apply {
-            putString(KEY_NAME, profile.name)
-            putString(KEY_SERVER, profile.server)
-            putString(KEY_PSK, profile.presharedKey)
-            putString(KEY_USERNAME, profile.username)
-            putString(KEY_PASSWORD, profile.password)
-            putString(KEY_EXCHANGE_MODE, profile.exchangeMode.name)
-            putString(KEY_IDENTITY_TYPE, profile.identityType.name)
-            putString(KEY_IDENTITY_VALUE, profile.identityValue)
-            putString(KEY_P1_ENCRYPTION, profile.phase1Encryption.name)
-            putString(KEY_P1_HASH, profile.phase1Hash.name)
-            putString(KEY_P1_DH, profile.phase1DhGroup.name)
-            putString(KEY_P2_ENCRYPTION, profile.phase2Encryption.name)
-            putString(KEY_P2_INTEGRITY, profile.phase2Integrity.name)
-            putString(KEY_P2_PFS, profile.phase2PfsGroup?.name ?: NONE)
-            putString(KEY_PPP_AUTH, profile.allowedPppAuth.joinToString(",") { it.name })
-            putInt(KEY_MTU, profile.mtu)
-            putString(KEY_DNS, profile.dnsServers)
-            putBoolean(KEY_BLOCK_IPV6, profile.blockIpv6)
-            putBoolean(KEY_FORCE_UDP, profile.forceUdpEncapsulation)
-            putBoolean(KEY_DEBUG_LOG, profile.debugLogging)
-        }.apply()
+        val written = writeProfile(prefs, profile, log)
+        // Published either way: a store that will not take the write is no reason to refuse the
+        // connection the user is about to ask for with exactly these settings.
         _profile.value = profile
-        log.i("Profile '${profile.name}' saved (encrypted=$usesEncryptedStorage)")
-    }
-
-    private fun read(): VpnProfile {
-        val defaults = VpnProfile()
-        return VpnProfile(
-            name = prefs.getString(KEY_NAME, defaults.name) ?: defaults.name,
-            server = prefs.getString(KEY_SERVER, defaults.server) ?: defaults.server,
-            presharedKey = prefs.getString(KEY_PSK, defaults.presharedKey) ?: defaults.presharedKey,
-            username = prefs.getString(KEY_USERNAME, defaults.username) ?: defaults.username,
-            password = prefs.getString(KEY_PASSWORD, defaults.password) ?: defaults.password,
-            exchangeMode = prefs.enum(KEY_EXCHANGE_MODE, defaults.exchangeMode, IkeExchangeMode::valueOf),
-            identityType = prefs.enum(KEY_IDENTITY_TYPE, defaults.identityType, IkeIdentityType::valueOf),
-            identityValue = prefs.getString(KEY_IDENTITY_VALUE, defaults.identityValue)
-                ?: defaults.identityValue,
-            phase1Encryption = prefs.enum(KEY_P1_ENCRYPTION, defaults.phase1Encryption, IkeEncryption::valueOf),
-            phase1Hash = prefs.enum(KEY_P1_HASH, defaults.phase1Hash, IkeHash::valueOf),
-            phase1DhGroup = prefs.enum(KEY_P1_DH, defaults.phase1DhGroup, DhGroup::valueOf),
-            phase2Encryption = prefs.enum(KEY_P2_ENCRYPTION, defaults.phase2Encryption, EspEncryption::valueOf),
-            phase2Integrity = prefs.enum(KEY_P2_INTEGRITY, defaults.phase2Integrity, EspIntegrity::valueOf),
-            phase2PfsGroup = readPfsGroup(defaults.phase2PfsGroup),
-            allowedPppAuth = readPppAuth(defaults.allowedPppAuth),
-            mtu = prefs.getInt(KEY_MTU, defaults.mtu),
-            dnsServers = prefs.getString(KEY_DNS, defaults.dnsServers) ?: defaults.dnsServers,
-            blockIpv6 = prefs.getBoolean(KEY_BLOCK_IPV6, defaults.blockIpv6),
-            forceUdpEncapsulation = prefs.getBoolean(KEY_FORCE_UDP, defaults.forceUdpEncapsulation),
-            debugLogging = prefs.getBoolean(KEY_DEBUG_LOG, defaults.debugLogging),
-        )
-    }
-
-    private fun readPfsGroup(default: DhGroup?): DhGroup? {
-        val raw = prefs.getString(KEY_P2_PFS, null) ?: return default
-        if (raw == NONE) return null
-        return runCatching { DhGroup.valueOf(raw) }.getOrDefault(default)
-    }
-
-    private fun readPppAuth(default: List<PppAuthProtocol>): List<PppAuthProtocol> {
-        val raw = prefs.getString(KEY_PPP_AUTH, null) ?: return default
-        val parsed = raw.split(',')
-            .mapNotNull { name -> runCatching { PppAuthProtocol.valueOf(name.trim()) }.getOrNull() }
-        return parsed.ifEmpty { default }
-    }
-
-    private fun <E : Enum<E>> SharedPreferences.enum(key: String, default: E, parse: (String) -> E): E {
-        val raw = getString(key, null) ?: return default
-        return runCatching { parse(raw) }.getOrElse {
-            log.w("Unknown value '$raw' for $key, falling back to $default")
-            default
+        if (written) {
+            // A successful write replaces whatever was unreadable before.
+            _profileWasUnreadable.value = false
+            log.i("Profile '${profile.name}' saved (encrypted=$usesEncryptedStorage)")
         }
     }
 
@@ -156,28 +90,6 @@ class ProfileRepository private constructor(
         private const val TAG = "Profiles"
         private const val ENCRYPTED_FILE = "vpn-profile-encrypted"
         private const val PLAIN_FILE = "vpn-profile"
-        private const val NONE = "NONE"
-
-        private const val KEY_NAME = "name"
-        private const val KEY_SERVER = "server"
-        private const val KEY_PSK = "psk"
-        private const val KEY_USERNAME = "username"
-        private const val KEY_PASSWORD = "password"
-        private const val KEY_EXCHANGE_MODE = "exchange_mode"
-        private const val KEY_IDENTITY_TYPE = "identity_type"
-        private const val KEY_IDENTITY_VALUE = "identity_value"
-        private const val KEY_P1_ENCRYPTION = "p1_encryption"
-        private const val KEY_P1_HASH = "p1_hash"
-        private const val KEY_P1_DH = "p1_dh"
-        private const val KEY_P2_ENCRYPTION = "p2_encryption"
-        private const val KEY_P2_INTEGRITY = "p2_integrity"
-        private const val KEY_P2_PFS = "p2_pfs"
-        private const val KEY_PPP_AUTH = "ppp_auth"
-        private const val KEY_MTU = "mtu"
-        private const val KEY_DNS = "dns"
-        private const val KEY_BLOCK_IPV6 = "block_ipv6"
-        private const val KEY_FORCE_UDP = "force_udp"
-        private const val KEY_DEBUG_LOG = "debug_log"
 
         @Volatile
         private var instance: ProfileRepository? = null

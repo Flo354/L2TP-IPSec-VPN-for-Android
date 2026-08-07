@@ -93,6 +93,50 @@ class UdpDatagramTest {
         )
     }
 
+    /** `encode(..., payload, offset)` means "from [offset] to the end", as everywhere else here. */
+    @Test
+    fun encodeWithoutALengthTakesTheRestOfTheBuffer() {
+        val bigger = Bytes.fromHex("ffff") + payload
+        val datagram = UdpDatagram.encode(1701, 1701, bigger, 2)
+        assertEquals(UdpDatagram.HEADER_SIZE + payload.size, datagram.size)
+        val parsed = UdpDatagram.parse(datagram)
+        assertArrayEquals(
+            payload,
+            datagram.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength),
+        )
+    }
+
+    /** A length whose end does not fit in an `Int` must not wrap the range check into a pass. */
+    @Test
+    fun rejectsARangeWhoseEndOverflows() {
+        val raw = Bytes.fromHex(capturedHex)
+        expectProtocolException { UdpDatagram.parse(raw, 1, Int.MAX_VALUE) }
+        expectProtocolException { UdpDatagram.parse(raw, raw.size + 1, 0) }
+    }
+
+    /**
+     * The whole point of [UdpDatagram.encodeInto] is filling a buffer the caller already owns, so
+     * wrapping a payload that is already sitting in that buffer has to work: the header must not
+     * land on payload bytes that have not been moved yet.
+     */
+    @Test
+    fun encodeIntoWrapsAPayloadAlreadyInTheOutputBuffer() {
+        for (payloadOffset in 0..UdpDatagram.HEADER_SIZE) {
+            val buffer = ByteArray(64) { 0x11 }
+            System.arraycopy(payload, 0, buffer, payloadOffset, payload.size)
+            val written = UdpDatagram.encodeInto(
+                buffer, 0, 1701, 1701, buffer, payloadOffset, payload.size,
+            )
+            val parsed = UdpDatagram.parse(buffer, 0, written)
+            assertEquals("offset $payloadOffset", 1701, parsed.sourcePort)
+            assertArrayEquals(
+                "offset $payloadOffset",
+                payload,
+                buffer.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength),
+            )
+        }
+    }
+
     @Test
     fun emptyPayloadIsLegal() {
         val datagram = UdpDatagram.encode(1701, 1701, ByteArray(0))

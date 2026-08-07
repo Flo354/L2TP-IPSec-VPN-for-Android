@@ -237,5 +237,32 @@ class IsakmpCodecTest {
                 Bytes.fromHex("00000001" + "00000001" + "03000008" + "01010000" + "00000004"),
             )
         }
+        // 65535 SPIs of zero width: eight bytes of wire announcing 65535 list entries.
+        assertThrows(ProtocolException::class.java) {
+            DeletePayload.decode(Bytes.fromHex("00000001" + "03" + "00" + "ffff"))
+        }
+        // A hundred four-byte SPIs, of which one is present.
+        assertThrows(ProtocolException::class.java) {
+            DeletePayload.decode(Bytes.fromHex("00000001" + "03" + "04" + "0064" + "11111111"))
+        }
+    }
+
+    /**
+     * A block whose header says "next payload = none" decodes to no payloads at all, and
+     * [PayloadChain.indexOfType] answers -1 for a payload the peer left out. Neither may reach a
+     * caller as an [IndexOutOfBoundsException]: parsers here only ever raise [ProtocolException].
+     */
+    @Test
+    fun `an out of range payload index is a protocol error`() {
+        val empty = IsakmpCodec.decodeBlock(ByteArray(16), PayloadType.NONE)
+        assertEquals(0, empty.payloads.size)
+        assertThrows(ProtocolException::class.java) { empty.bytesAfter(0) }
+        assertThrows(ProtocolException::class.java) { empty.bodyAt(0) }
+
+        val chain = IsakmpCodec.decodeBlock(
+            IsakmpCodec.encodeChain(listOf(NoncePayload(ByteArray(4)))), PayloadType.NONCE,
+        )
+        assertEquals(-1, chain.indexOfType(PayloadType.HASH))
+        assertThrows(ProtocolException::class.java) { chain.bodyAt(chain.indexOfType(PayloadType.HASH)) }
     }
 }

@@ -27,10 +27,13 @@ object UdpDatagram {
         destinationPort: Int,
         payload: ByteArray,
         payloadOffset: Int = 0,
-        payloadLength: Int = payload.size,
+        payloadLength: Int = payload.size - payloadOffset,
         sourceIp: ByteArray? = null,
         destinationIp: ByteArray? = null,
     ): ByteArray {
+        // Checked here as well as in encodeInto: a negative length would otherwise blow up in the
+        // array allocation below, before the message that says what is actually wrong.
+        require(payloadLength >= 0) { "negative payload length $payloadLength" }
         val out = ByteArray(HEADER_SIZE + payloadLength)
         encodeInto(out, 0, sourcePort, destinationPort, payload, payloadOffset, payloadLength)
         if (sourceIp != null && destinationIp != null) {
@@ -48,8 +51,11 @@ object UdpDatagram {
 
     /**
      * Writes the header and payload straight into [out] with a zero checksum, returning the number
-     * of bytes written. Used on the send path, where the datagram is built directly inside the ESP
-     * plaintext buffer to avoid one copy per packet.
+     * of bytes written. For callers that already own a big enough buffer - the ESP plaintext
+     * buffer, say - and want to fill it in instead of paying an allocation and a copy per packet.
+     *
+     * [out] may be the same array as [payload], even with overlapping ranges: the payload is moved
+     * before the header is stamped, so the header never lands on bytes still to be read.
      */
     fun encodeInto(
         out: ByteArray,
@@ -61,14 +67,19 @@ object UdpDatagram {
         payloadLength: Int,
     ): Int {
         require(payloadLength >= 0) { "negative payload length $payloadLength" }
-        require(payloadOffset >= 0 && payloadOffset + payloadLength <= payload.size) {
-            "payload range $payloadOffset..${payloadOffset + payloadLength} outside ${payload.size} bytes"
+        // Every range check here is a subtraction, never a sum: the sums can overflow an `Int` and
+        // a wrapped comparison would pass.
+        require(payloadOffset >= 0 && payloadLength <= payload.size - payloadOffset) {
+            "payload range of $payloadLength bytes at $payloadOffset outside ${payload.size} bytes"
         }
         val total = HEADER_SIZE + payloadLength
         require(total <= 0xFFFF) { "UDP length $total does not fit in 16 bits" }
-        require(outOffset >= 0 && outOffset + total <= out.size) {
-            "output buffer too small: need ${outOffset + total}, have ${out.size}"
+        require(outOffset >= 0 && total <= out.size - outOffset) {
+            "output buffer too small: need $total bytes at $outOffset, have ${out.size}"
         }
+        // The payload moves first. System.arraycopy handles overlap, so this is also correct when
+        // [out] is [payload]; stamping the header first would overwrite bytes still to be read.
+        System.arraycopy(payload, payloadOffset, out, outOffset + HEADER_SIZE, payloadLength)
         out[outOffset] = (sourcePort ushr 8).toByte()
         out[outOffset + 1] = sourcePort.toByte()
         out[outOffset + 2] = (destinationPort ushr 8).toByte()
@@ -77,7 +88,6 @@ object UdpDatagram {
         out[outOffset + 5] = total.toByte()
         out[outOffset + 6] = 0
         out[outOffset + 7] = 0
-        System.arraycopy(payload, payloadOffset, out, outOffset + HEADER_SIZE, payloadLength)
         return total
     }
 
@@ -91,15 +101,17 @@ object UdpDatagram {
 
     /**
      * Parses a UDP datagram. The header length field wins over [length] as long as it fits, so a
-     * buffer that was padded by the caller still yields the exact payload.
+     * buffer that was padded by the caller still yields the exact payload. The checksum field is
+     * not looked at: the sender is allowed to leave it at zero and this one does.
      *
-     * The payload is returned as a range rather than a copy, and the four fields are read
-     * directly instead of through a [com.arcansecurity.vpn.l2tpipsec.core.util.ByteReader], because this runs
-     * once per received packet on the forwarding path.
+     * The payload is described as a range inside [data] rather than copied out, and the three
+     * header fields are read by hand instead of through a
+     * [com.arcansecurity.vpn.l2tpipsec.core.util.ByteReader], because this runs once per received packet on
+     * the forwarding path. The caller must copy the payload out before the buffer is reused.
      */
     fun parse(data: ByteArray, offset: Int = 0, length: Int = data.size - offset): Parsed {
-        if (offset < 0 || length < 0 || offset + length > data.size) {
-            throw ProtocolException("UDP range $offset..${offset + length} outside ${data.size} bytes")
+        if (offset < 0 || length < 0 || length > data.size - offset) {
+            throw ProtocolException("UDP range of $length bytes at $offset outside ${data.size} bytes")
         }
         if (length < HEADER_SIZE) throw ProtocolException("truncated UDP header: $length bytes")
         val sourcePort = u16(data, offset)

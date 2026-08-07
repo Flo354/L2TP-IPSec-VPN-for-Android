@@ -5,6 +5,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 
 class CbcCipherTest {
 
@@ -62,6 +63,66 @@ class CbcCipherTest {
         assertEquals(16, CbcCipher.forIke(IkeEncryption.AES_CBC_128).blockBytes)
         assertEquals(8, CbcCipher.forIke(IkeEncryption.TRIPLE_DES_CBC).blockBytes)
         assertEquals(8, CbcCipher.forEsp(EspEncryption.ESP_3DES).blockBytes)
+    }
+
+    /**
+     * The JCE cipher behind a [CbcCipher] is cached per thread, so one shared instance — which is
+     * what the ESP layer has, encrypting the same outbound SA from the uplink thread, the
+     * maintenance thread's HELLOs and the control path — must still produce byte-for-byte the same
+     * result as the single-threaded case. A cache that were merely shared instead of per-thread
+     * would let two packets interleave one `Cipher`'s state and corrupt both.
+     */
+    @Test
+    fun `one shared instance produces the same bytes from many threads at once`() {
+        val shared = CbcCipher.forEsp(EspEncryption.ESP_AES_CBC_256)
+        val workers = 8
+        val keys = List(workers) { t -> ByteArray(32) { (it * 31 + t).toByte() } }
+        val ivs = List(workers) { t -> ByteArray(16) { (it * 7 + t).toByte() } }
+        val plaintexts = List(workers) { t -> ByteArray(64) { (it + t * 13).toByte() } }
+        // Pinned single-threaded, before any concurrency, so a race cannot corrupt the reference.
+        val expected = List(workers) { t -> shared.encrypt(keys[t], ivs[t], plaintexts[t]) }
+
+        val mismatches = AtomicInteger()
+        val threads = List(workers) { t ->
+            Thread {
+                repeat(300) {
+                    if (!shared.encrypt(keys[t], ivs[t], plaintexts[t]).contentEquals(expected[t])) {
+                        mismatches.incrementAndGet()
+                    }
+                    if (!shared.decrypt(keys[t], ivs[t], expected[t]).contentEquals(plaintexts[t])) {
+                        mismatches.incrementAndGet()
+                    }
+                }
+            }
+        }
+        threads.forEach { it.start() }
+        threads.forEach { it.join() }
+        assertEquals(0, mismatches.get())
+    }
+
+    /** Alternating transformations on one thread must not let a cached cipher answer for another. */
+    @Test
+    fun `interleaving transformations on one thread keeps them apart`() {
+        val aes = CbcCipher.forIke(IkeEncryption.AES_CBC_128)
+        val des3 = CbcCipher.forEsp(EspEncryption.ESP_3DES)
+        val aesKey = ByteArray(16) { it.toByte() }
+        val des3Key = ByteArray(24) { (it + 5).toByte() }
+
+        repeat(4) {
+            val aesData = ByteArray(32) { (it * 3).toByte() }
+            val des3Data = ByteArray(24) { (it * 5).toByte() }
+            assertArrayEquals(
+                aesData,
+                aes.decrypt(aesKey, iv, aes.encrypt(aesKey, iv, aesData)),
+            )
+            val des3Iv = ByteArray(8) { (it + 1).toByte() }
+            assertArrayEquals(
+                des3Data,
+                des3.decrypt(des3Key, des3Iv, des3.encrypt(des3Key, des3Iv, des3Data)),
+            )
+        }
+        // The pinned NIST vector must still hold after all that reuse.
+        assertArrayEquals(ciphertext, aes256.encrypt(key, iv, plaintext))
     }
 
     @Test

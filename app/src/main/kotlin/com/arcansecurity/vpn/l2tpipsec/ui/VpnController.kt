@@ -33,6 +33,9 @@ class VpnController private constructor(context: Context) {
     /** `false` when the keystore refused to encrypt the store; the UI warns about it. */
     val usesEncryptedStorage: Boolean get() = repository.usesEncryptedStorage
 
+    /** `true` when the saved profile could not be decrypted, so the form starts blank. */
+    val profileWasUnreadable: StateFlow<Boolean> get() = repository.profileWasUnreadable
+
     private val _draft = MutableStateFlow(repository.profile.value)
     private val _touched = MutableStateFlow(emptySet<ProfileField>())
     private val _showAllErrors = MutableStateFlow(false)

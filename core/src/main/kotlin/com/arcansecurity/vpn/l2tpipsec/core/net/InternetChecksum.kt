@@ -3,8 +3,9 @@ package com.arcansecurity.vpn.l2tpipsec.core.net
 /**
  * The one's-complement checksum shared by IPv4, UDP and ICMP (RFC 1071).
  *
- * The stack needs it in two places: to stamp the IPv4 header it hands to the TUN interface, and to
- * validate/produce the inner UDP datagram that carries L2TP.
+ * The tunnel itself only ever produces one: the checksum of the inner UDP/1701 datagram carrying
+ * L2TP, and even that one only when [UdpDatagram.encode] is given the addresses. The rest is here
+ * because [Ipv4Header] and the tests need to stamp and verify headers.
  */
 object InternetChecksum {
 
@@ -30,7 +31,7 @@ object InternetChecksum {
         protocol: Int,
         payload: ByteArray,
         payloadOffset: Int = 0,
-        payloadLength: Int = payload.size,
+        payloadLength: Int = payload.size - payloadOffset,
     ): Int {
         require(src.size >= 4 && dst.size >= 4) { "IPv4 addresses must be 4 bytes" }
         // The pseudo-header is an even number of bytes, so it never shifts the parity of the
@@ -43,8 +44,11 @@ object InternetChecksum {
 
     /** Un-complemented running sum; kept as a [Long] so the carries can be folded in at the end. */
     private fun partialSum(data: ByteArray, offset: Int, length: Int): Long {
-        require(offset >= 0 && length >= 0 && offset + length <= data.size) {
-            "range $offset..${offset + length} outside a ${data.size}-byte buffer"
+        // Written as a subtraction: `offset + length` can overflow, and a wrapped comparison used
+        // to let the loop below run over an empty range and report a checksum of a buffer it never
+        // read.
+        require(offset >= 0 && length >= 0 && length <= data.size - offset) {
+            "range of $length bytes at $offset outside a ${data.size}-byte buffer"
         }
         var sum = 0L
         var i = offset

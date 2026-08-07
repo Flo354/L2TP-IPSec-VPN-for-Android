@@ -17,9 +17,15 @@ interface UdpSocketChannel : Closeable {
     val localAddress: InetAddress
     val localPort: Int
 
+    /**
+     * Implementations must tolerate concurrent calls: the tunnel sends user traffic, control
+     * frames and IKE from three different threads through the one socket it owns. `DatagramSocket`
+     * and `DatagramChannel` both satisfy this. [close] may also be called while a [receive] is in
+     * flight, and must make that call fail rather than block for ever.
+     */
     fun send(data: ByteArray, offset: Int, length: Int, destination: InetSocketAddress)
 
-    /** Blocks for at most [timeoutMs]; returns `null` on timeout. */
+    /** Blocks for at most [timeoutMs]; returns `null` on timeout. Only one thread receives. */
     fun receive(buffer: ByteArray, timeoutMs: Int): Datagram?
 }
 

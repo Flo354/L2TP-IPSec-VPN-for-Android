@@ -3,6 +3,7 @@ package com.arcansecurity.vpn.l2tpipsec.platform
 import com.arcansecurity.vpn.l2tpipsec.core.util.LogLevel
 import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -89,5 +90,25 @@ class LogRingBufferTest {
     @Test
     fun `the default capacity is 500 lines`() {
         assertEquals(500, LogRingBuffer().capacity)
+    }
+
+    /**
+     * The log sheet follows the tail by restarting a `LaunchedEffect` whenever the published lines
+     * change. Keying that on `lines.size` looked equivalent and is not: once the buffer is full the
+     * size stops moving while the content keeps scrolling, which is exactly the long negotiation
+     * you opened the sheet to watch. This pins the property the sheet relies on.
+     */
+    @Test
+    fun `past the capacity the size stops changing but the published list does not`() {
+        val buffer = buffer(3)
+        repeat(3) { index -> buffer.appendLine("line $index") }
+        val full = buffer.lines.value
+
+        buffer.appendLine("line 3")
+
+        val next = buffer.lines.value
+        assertEquals(full.size, next.size)
+        assertNotEquals(full, next)
+        assertEquals(listOf("line 1", "line 2", "line 3"), next)
     }
 }

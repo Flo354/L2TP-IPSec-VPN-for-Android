@@ -49,14 +49,29 @@ class FakeIkeTransport(
     /** Every datagram the negotiator has sent, in order. */
     val sent = mutableListOf<ByteArray>()
 
+    /** Records outbound datagrams but never shows them to the responder, modelling a dead path. */
+    var dropOutbound = false
+
     private val inbox = ArrayDeque<ByteArray>()
+    private val injected = ArrayDeque<ByteArray>()
 
     override fun enableNatTraversal() {
         natTraversalActive = true
     }
 
+    /**
+     * Queues [message] so it is delivered *before* whatever the responder answers next with. Real
+     * peers reorder: an informational the peer had already sent routinely overtakes the reply we
+     * are waiting for.
+     */
+    fun deliverBeforeNextReply(message: ByteArray) {
+        injected.addLast(message)
+    }
+
     override fun sendIsakmp(message: ByteArray) {
         sent += message
+        while (injected.isNotEmpty()) inbox.addLast(injected.removeFirst())
+        if (dropOutbound) return
         responder.onMessage(message)?.let { inbox.addLast(it) }
     }
 

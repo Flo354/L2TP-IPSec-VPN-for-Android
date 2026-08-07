@@ -6,10 +6,8 @@
     <string name="notification_channel_description">Shows the state of the L2TP/IPsec tunnel while it is running.</string>
     <string name="notification_text_idle">Not connected</string>
     <string name="action_disconnect">Disconnect</string>
-
     <!--
-        Declared as PROPERTY_SPECIAL_USE_FGS_SUBTYPE: Android 14 has no foreground service type
-        for VPNs, so the platform asks us to justify the specialUse type in words.
+        The PROPERTY_SPECIAL_USE_FGS_SUBTYPE justification is not here on purpose: it lives inline
+        in AndroidManifest.xml so it survives the manifest merge as readable text.
     -->
-    <string name="fgs_special_use_subtype">Keeps the user\'s L2TP/IPsec tunnel established while the app is in the background</string>
 </resources>

@@ -1,5 +1,7 @@
 package com.arcansecurity.vpn.l2tpipsec.ui
 
+import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -27,14 +29,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.Clipboard
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import com.arcansecurity.vpn.l2tpipsec.platform.AndroidLogger
 import com.arcansecurity.vpn.l2tpipsec.ui.theme.MonoTextStyle
+import kotlinx.coroutines.launch
 
 /**
  * The live view of [AndroidLogger]'s ring buffer.
@@ -51,11 +56,14 @@ fun LogsSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val lines by logger.lines.collectAsState()
     val listState = rememberLazyListState()
-    val clipboard = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
-    // Follow the tail: a log you have to scroll is a log you stop reading.
-    LaunchedEffect(lines.size) {
+    // Follow the tail: a log you have to scroll is a log you stop reading. Keyed on the content and
+    // not on lines.size, which stops changing the moment the ring buffer is full — which is exactly
+    // when a long negotiation is worth watching.
+    LaunchedEffect(lines) {
         if (lines.isNotEmpty()) {
             listState.scrollToItem(lines.lastIndex)
         }
@@ -79,7 +87,7 @@ fun LogsSheet(
                     )
                 }
                 Row {
-                    IconButton(onClick = { clipboard.setText(AnnotatedString(logger.snapshot())) }) {
+                    IconButton(onClick = { scope.launch { copyLog(clipboard, logger) } }) {
                         Icon(Icons.Filled.ContentCopy, contentDescription = "Copy the log")
                     }
                     IconButton(onClick = { shareText(context, logger.snapshot()) }) {
@@ -135,13 +143,21 @@ private fun lineColor(line: String) = when {
     else -> MaterialTheme.colorScheme.onSurface
 }
 
-private fun shareText(context: android.content.Context, text: String) {
+/** `Clipboard.setClipEntry` suspends, so the copy button hands it to the composition's scope. */
+private suspend fun copyLog(clipboard: Clipboard, logger: AndroidLogger) {
+    clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(LOG_TITLE, logger.snapshot())))
+}
+
+private fun shareText(context: Context, text: String) {
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
-        putExtra(Intent.EXTRA_SUBJECT, "L2TP/IPsec log")
+        putExtra(Intent.EXTRA_SUBJECT, LOG_TITLE)
         putExtra(Intent.EXTRA_TEXT, text)
     }
     context.startActivity(
         Intent.createChooser(intent, "Share the log").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
     )
 }
+
+/** Clipboard label and e-mail subject; the same words in both makes a shared trace easy to find. */
+private const val LOG_TITLE = "L2TP/IPsec log"

@@ -62,10 +62,6 @@ object VpnStatusRepository {
     /** Wall clock of the last successful connection, or 0. */
     val connectedSinceMs: StateFlow<Long> get() = _connectedSinceMs.asStateFlow()
 
-    /** True from the moment the user asks to connect until the service is gone. */
-    val isBusy: Boolean
-        get() = _state.value !in setOf(TunnelState.IDLE, TunnelState.FAILED)
-
     internal fun onState(state: TunnelState, detail: String? = null) {
         _state.value = state
         _detail.value = detail

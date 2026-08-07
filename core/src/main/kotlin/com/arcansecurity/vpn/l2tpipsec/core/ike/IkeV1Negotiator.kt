@@ -26,9 +26,12 @@ import java.net.InetAddress
  * NAT traversal per RFC 3947, and the informational exchanges (DPD, Delete) that keep the SA
  * observable and tear it down cleanly.
  *
- * The class is single-threaded and stateful: it owns the initiator cookie and the negotiated NAT-T
- * dialect for the whole life of one ISAKMP SA. Everything that phase 2 and the ESP layer need is
- * handed back in [Phase1Result] and [Phase2Result].
+ * The class is stateful and not thread-safe: it owns the initiator cookie, the responder cookie and
+ * the negotiated NAT-T dialect for the whole life of one ISAKMP SA, and every exchange it drives
+ * reads and writes those while blocked on the transport. Callers must serialise it — the tunnel
+ * rekeys from its maintenance thread while a teardown may arrive from another, and holds a lock
+ * across every call for exactly that reason. Everything phase 2 and the ESP layer need is handed
+ * back in [Phase1Result] and [Phase2Result].
  */
 class IkeV1Negotiator(
     private val config: VpnConfig,
@@ -49,6 +52,7 @@ class IkeV1Negotiator(
     /** Set as soon as phase 1 completes so informational exchanges can be decrypted mid-flight. */
     private var activePhase1: Phase1Result? = null
 
+    /** Kept positive so the counter, and the logs that print it, stay readable for 2^31 probes. */
     private var dpdSequence: Int = randomNonZeroInt() and 0x7FFFFFFF
 
     /**
@@ -311,10 +315,20 @@ class IkeV1Negotiator(
         }
 
         val choice = checkResponderPhase2Sa(chain2, udpEncapsulationRequired)
-        val qmSecret = if (pfs == null) ByteArray(0) else {
+        val qmSecret = if (pfs != null) {
             pfs.computeSharedSecret(
                 requirePayload(chain2.find<KeyExchangePayload>(), "PFS key exchange").data,
             )
+        } else {
+            // Ignoring a key exchange we never asked for would leave the responder seeding KEYMAT
+            // with a secret we do not have, and every ESP packet would fail its integrity check.
+            if (chain2.find<KeyExchangePayload>() != null) {
+                throw TunnelException(
+                    TunnelErrorKind.IPSEC_SA_FAILED,
+                    "responder answered with a PFS key exchange we did not propose",
+                )
+            }
+            ByteArray(0)
         }
 
         val encryptionKeyBytes = config.phase2.encryption.keyBytes
@@ -552,12 +566,13 @@ class IkeV1Negotiator(
             if (requireUdpEncapsulation && !EncapsulationMode.isUdpEncapsulated(encapsulationMode)) continue
             val group = transform.intAttribute(Phase2Attribute.GROUP_DESCRIPTION)
             val pfsGroup = if (group == null) null else DhGroup.find(group) ?: continue
-            val lifetime =
-                if (transform.intAttribute(Phase2Attribute.SA_LIFE_TYPE) == Phase2Attribute.LIFE_TYPE_SECONDS) {
-                    transform.intAttribute(Phase2Attribute.SA_LIFE_DURATION) ?: config.phase2.lifetimeSeconds
-                } else {
-                    config.phase2.lifetimeSeconds
-                }
+            val lifetime = negotiatedLifetimeSeconds(
+                transform,
+                Phase2Attribute.SA_LIFE_TYPE,
+                Phase2Attribute.LIFE_TYPE_SECONDS,
+                Phase2Attribute.SA_LIFE_DURATION,
+                config.phase2.lifetimeSeconds,
+            )
             return Phase2Offer(
                 spi = ByteReader(proposal.spi).i32(),
                 transform = transform,
@@ -650,7 +665,16 @@ class IkeV1Negotiator(
         return InformationalResult(deletedEsp, isakmpDeleted)
     }
 
-    /** Sends a DPD R-U-THERE and returns the sequence number used. */
+    /**
+     * Sends a DPD R-U-THERE (RFC 3706) and returns the sequence number used.
+     *
+     * Nothing in the client calls this today: the tunnel layer decides when to probe, and it infers
+     * liveness from the L2TP HELLO keepalive instead, which covers the whole stack rather than just
+     * the ISAKMP SA. Probing is kept available here because the two answer different questions — a
+     * peer can keep the ISAKMP SA alive while the IPsec SA underneath it has stopped carrying
+     * traffic. Probes the *peer* sends are answered either way, by [handleInformational] and, while
+     * an exchange is in flight, by [processInformational].
+     */
     fun sendDpdRequest(phase1: Phase1Result): Long {
         val sequence = dpdSequence++
         sendInformational(
@@ -707,7 +731,15 @@ class IkeV1Negotiator(
     private fun decodeInformational(phase1: Phase1Result?, raw: ByteArray): PayloadChain? = try {
         val header = IsakmpHeader.decode(raw)
         when {
-            !header.isEncrypted -> IsakmpCodec.decodeMessage(raw, header)
+            // RFC 2408 section 4.8: only an exchange sent before the ISAKMP SA exists may travel in
+            // the clear. Afterwards an unprotected Delete or error notify is unauthenticated, and
+            // acting on one would let anyone who has seen our cookies tear the tunnel down.
+            !header.isEncrypted && phase1 == null -> IsakmpCodec.decodeMessage(raw, header)
+            !header.isEncrypted -> {
+                log.w("dropping an unprotected informational received after phase 1 completed")
+                null
+            }
+
             phase1 == null -> {
                 log.w("dropping an encrypted informational received before phase 1 completed")
                 null
@@ -722,14 +754,19 @@ class IkeV1Negotiator(
                 val chain = IsakmpCodec.decodeBlock(
                     crypto.decrypt(payloadBlockOf(raw), iv), header.nextPayload,
                 )
-                val expected = crypto.prf.mac(phase1.skeyidA, messageIdBytes, chain.bytesAfter(0))
-                if (chain.indexOfType(PayloadType.HASH) != 0 ||
-                    !Bytes.constantTimeEquals(expected, chain.bodyAt(0))
-                ) {
-                    log.w("dropping an informational exchange with a bad HASH")
+                // The HASH must be located before anything is hashed: an empty chain, or one that
+                // starts with another payload, has no "bytes after the HASH" to authenticate.
+                if (chain.indexOfType(PayloadType.HASH) != 0) {
+                    log.w("dropping an informational exchange that does not start with a HASH")
                     null
                 } else {
-                    chain
+                    val expected = crypto.prf.mac(phase1.skeyidA, messageIdBytes, chain.bytesAfter(0))
+                    if (!Bytes.constantTimeEquals(expected, chain.bodyAt(0))) {
+                        log.w("dropping an informational exchange with a bad HASH")
+                        null
+                    } else {
+                        chain
+                    }
                 }
             }
         }
@@ -753,11 +790,17 @@ class IkeV1Negotiator(
                 log.i("peer sent notify ${notify.notifyType} during negotiation")
             }
         }
-        chain.all<DeletePayload>().firstOrNull()?.let {
-            throw TunnelException(
-                TunnelErrorKind.PEER_DISCONNECTED,
-                "peer deleted the SA (protocol ${it.protocolId}) while we were negotiating",
-            )
+        for (delete in chain.all<DeletePayload>()) {
+            if (delete.protocolId == ProtocolId.ISAKMP) {
+                throw TunnelException(
+                    TunnelErrorKind.PEER_DISCONNECTED,
+                    "peer deleted the ISAKMP SA while we were negotiating",
+                )
+            }
+            // An IPsec delete is routine here: a peer that rekeys retires the superseded SA as soon
+            // as the new one is up, so it regularly overtakes the HASH(3) we are still waiting for.
+            // Aborting on it would kill a healthy tunnel; the SA overlap window retires it instead.
+            log.i("peer deleted an SA for protocol ${delete.protocolId} while we were negotiating")
         }
     }
 
@@ -853,8 +896,11 @@ class IkeV1Negotiator(
         return SaPayload(listOf(ProposalPayload(1, ProtocolId.ISAKMP, ByteArray(0), listOf(transform))))
     }
 
-    /** The responder must echo the single transform we offered; anything else is unusable. */
-    /** Returns the ISAKMP SA lifetime the responder settled on, which may be shorter than ours. */
+    /**
+     * The responder must echo the single transform we offered; anything else is unusable.
+     *
+     * Returns the ISAKMP SA lifetime the responder settled on, which may be shorter than ours.
+     */
     private fun checkResponderPhase1Sa(chain: PayloadChain): Int {
         val sa = requirePayload(chain.find<SaPayload>(), "responder SA")
         val transform = sa.proposals.firstOrNull()?.transforms?.firstOrNull()
@@ -876,11 +922,37 @@ class IkeV1Negotiator(
         }
         // Schedule the rekey off the peer's number: proposing three hours and being granted ten
         // minutes would otherwise leave us renegotiating long after the SA had been torn down.
-        return if (transform.intAttribute(Phase1Attribute.LIFE_TYPE) == Phase1Attribute.LIFE_TYPE_SECONDS) {
-            transform.intAttribute(Phase1Attribute.LIFE_DURATION) ?: p.lifetimeSeconds
-        } else {
-            p.lifetimeSeconds
-        }
+        return negotiatedLifetimeSeconds(
+            transform,
+            Phase1Attribute.LIFE_TYPE,
+            Phase1Attribute.LIFE_TYPE_SECONDS,
+            Phase1Attribute.LIFE_DURATION,
+            p.lifetimeSeconds,
+        )
+    }
+
+    /**
+     * The SA lifetime the peer settled on, in seconds, or [fallback] when it did not name one we
+     * can schedule against.
+     *
+     * A life duration is only usable when it is expressed in seconds and decodes strictly positive.
+     * The attribute is a raw 32-bit field, so a four-byte value with its top bit set — 0xFFFFFFFF,
+     * which several stacks send to mean "no limit" — reads back negative through
+     * [SaAttribute.intValue], and a zero or negative lifetime would leave the tunnel either
+     * rekeying in a tight loop or never at all.
+     */
+    private fun negotiatedLifetimeSeconds(
+        transform: TransformPayload,
+        lifeTypeAttribute: Int,
+        secondsLifeType: Int,
+        lifeDurationAttribute: Int,
+        fallback: Int,
+    ): Int {
+        if (transform.intAttribute(lifeTypeAttribute) != secondsLifeType) return fallback
+        val duration = transform.intAttribute(lifeDurationAttribute) ?: return fallback
+        if (duration > 0) return duration
+        log.w("peer named an unusable SA lifetime of $duration seconds; keeping $fallback")
+        return fallback
     }
 
     private fun buildPhase2Sa(spi: Int, encapsulationMode: Int): SaPayload {
@@ -919,7 +991,12 @@ class IkeV1Negotiator(
         val p = config.phase2
         val keyLengthOk = !p.encryption.needsKeyLengthAttribute ||
             transform.intAttribute(Phase2Attribute.KEY_LENGTH) == p.encryption.keyBits
-        val matches = transform.transformId == p.encryption.transformId && keyLengthOk &&
+        // A responder that names a PFS group we did not propose expects KEYMAT seeded with a second
+        // Diffie-Hellman secret. Accepting it would key the two directions differently and drop
+        // every ESP packet in silence, so the group has to match whatever we asked for.
+        val responderGroup = transform.intAttribute(Phase2Attribute.GROUP_DESCRIPTION)
+        val pfsGroupOk = responderGroup == null || responderGroup == p.pfsGroup?.groupId
+        val matches = transform.transformId == p.encryption.transformId && keyLengthOk && pfsGroupOk &&
             transform.intAttribute(Phase2Attribute.AUTHENTICATION_ALGORITHM) == p.integrity.attributeValue
         if (!matches) {
             throw TunnelException(
@@ -936,12 +1013,13 @@ class IkeV1Negotiator(
                     "carry ESP inside UDP",
             )
         }
-        val lifetime =
-            if (transform.intAttribute(Phase2Attribute.SA_LIFE_TYPE) == Phase2Attribute.LIFE_TYPE_SECONDS) {
-                transform.intAttribute(Phase2Attribute.SA_LIFE_DURATION) ?: p.lifetimeSeconds
-            } else {
-                p.lifetimeSeconds
-            }
+        val lifetime = negotiatedLifetimeSeconds(
+            transform,
+            Phase2Attribute.SA_LIFE_TYPE,
+            Phase2Attribute.LIFE_TYPE_SECONDS,
+            Phase2Attribute.SA_LIFE_DURATION,
+            p.lifetimeSeconds,
+        )
         return Phase2Choice(ByteReader(proposal.spi).i32(), encapsulationMode, lifetime)
     }
 
@@ -952,6 +1030,11 @@ class IkeV1Negotiator(
     private fun localIdPayload(): IdentificationPayload {
         val identity = config.localIdentity
         // Road-warrior clients send their own address with protocol and port zeroed.
+        //
+        // AUTO_IPV4 and IPV4_ADDR deliberately share wire type 1: they differ only in where the
+        // address comes from, not in what the peer sees. Dispatching on the enum entry rather than
+        // on IkeIdentityType.value is what keeps them apart — a reverse lookup by wire value could
+        // not tell them apart, and this is the only place in the package that maps the two.
         return when (identity.type) {
             IkeIdentityType.AUTO_IPV4 ->
                 IdentificationPayload(IdType.IPV4_ADDR, 0, 0, ipv4(transport.localAddress))

@@ -36,6 +36,13 @@ class FakeIkeResponder(
     private val espIntegrity: EspIntegrity = EspIntegrity.HMAC_SHA2_256_128,
     /** `null` makes the responder advertise no NAT traversal support at all. */
     private val natTraversalVendorId: ByteArray? = VendorIds.RFC_3947,
+    /**
+     * Bends the transform this responder echoes back, so a test can model a peer that answers with
+     * attributes the client never proposed. Applied to both the phase-1 and the phase-2 echo.
+     */
+    private val rewriteEchoedTransform: (TransformPayload) -> TransformPayload = { it },
+    /** Answers a Quick Mode with a PFS key exchange even though the client proposed no PFS. */
+    private val unsolicitedPhase2KeyExchange: Boolean = false,
 ) {
 
     private val psk = presharedKey.toByteArray(Charsets.UTF_8)
@@ -289,13 +296,22 @@ class FakeIkeResponder(
             transform.intAttribute(Phase2Attribute.ENCAPSULATION_MODE) ?: EncapsulationMode.TUNNEL
 
         val payloads = mutableListOf<IkePayload>(
-            SaPayload(listOf(ProposalPayload(1, ProtocolId.ESP, int32(inboundSpi), listOf(transform)))),
+            SaPayload(
+                listOf(
+                    ProposalPayload(
+                        1, ProtocolId.ESP, int32(inboundSpi), listOf(rewriteEchoedTransform(transform)),
+                    ),
+                ),
+            ),
             NoncePayload(quickModeNr),
         )
-        chain.find<KeyExchangePayload>()?.let {
+        val peerKeyExchange = chain.find<KeyExchangePayload>()
+        if (peerKeyExchange != null) {
             val pfs = DiffieHellman.generate(dhGroup)
-            quickModeSecret = pfs.computeSharedSecret(it.data)
+            quickModeSecret = pfs.computeSharedSecret(peerKeyExchange.data)
             payloads += KeyExchangePayload(pfs.publicValue)
+        } else if (unsolicitedPhase2KeyExchange) {
+            payloads += KeyExchangePayload(DiffieHellman.generate(dhGroup).publicValue)
         }
         payloads += chain.all<IdentificationPayload>()
 
@@ -486,7 +502,7 @@ class FakeIkeResponder(
     }
 
     private fun echoSa(chain: PayloadChain): SaPayload {
-        val transform = chain.find<SaPayload>()!!.proposals[0].transforms[0]
+        val transform = rewriteEchoedTransform(chain.find<SaPayload>()!!.proposals[0].transforms[0])
         return SaPayload(listOf(ProposalPayload(1, ProtocolId.ISAKMP, ByteArray(0), listOf(transform))))
     }
 

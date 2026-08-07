@@ -1,6 +1,8 @@
 package com.arcansecurity.vpn.l2tpipsec.core.ike
 
+import com.arcansecurity.vpn.l2tpipsec.core.crypto.CbcCipher
 import com.arcansecurity.vpn.l2tpipsec.core.crypto.DhGroup
+import com.arcansecurity.vpn.l2tpipsec.core.crypto.Prf
 import com.arcansecurity.vpn.l2tpipsec.core.ike.IkeTestFixtures.LOCAL_PORT
 import com.arcansecurity.vpn.l2tpipsec.core.ike.IkeTestFixtures.PRESHARED_KEY
 import com.arcansecurity.vpn.l2tpipsec.core.ike.IkeTestFixtures.config
@@ -10,6 +12,7 @@ import com.arcansecurity.vpn.l2tpipsec.core.tunnel.IkeExchangeMode
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.Phase2Proposal
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelErrorKind
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelException
+import com.arcansecurity.vpn.l2tpipsec.core.util.ByteWriter
 import com.arcansecurity.vpn.l2tpipsec.core.util.Bytes
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -231,6 +234,129 @@ class IkeV1NegotiatorTest {
         val result = negotiator.handleInformational(phase1, tampered)
         assertFalse(result.isakmpDeleted)
         assertTrue(result.deletedEspSpis.isEmpty())
+    }
+
+    /**
+     * A payload block that decrypts to nothing but padding: the header says "next payload = none",
+     * so the chain is empty and there is no HASH to authenticate it with.
+     */
+    @Test
+    fun `an informational with an empty payload chain is dropped`() {
+        val responder = responder()
+        val negotiator = IkeV1Negotiator(config(), transportFor(responder))
+        val phase1 = negotiator.establishPhase1()
+
+        val cipher = CbcCipher.forIke(phase1.encryption)
+        val prf = Prf(phase1.hash)
+        val messageId = 0x0badc0de
+        val messageIdBytes = ByteWriter(4).i32(messageId).toByteArray()
+        val iv = Bytes.truncate(prf.digest(phase1.phase1Iv, messageIdBytes), cipher.blockBytes)
+        val message = IsakmpCodec.buildMessage(
+            phase1.initiatorCookie, phase1.responderCookie, ExchangeType.INFORMATIONAL,
+            IsakmpFlags.ENCRYPTION, messageId, PayloadType.NONE,
+            cipher.encrypt(phase1.encryptionKey, iv, ByteArray(cipher.blockBytes)),
+        )
+
+        val result = negotiator.handleInformational(phase1, message)
+        assertFalse(result.isakmpDeleted)
+        assertTrue(result.deletedEspSpis.isEmpty())
+    }
+
+    /**
+     * RFC 2408 section 4.8: once the ISAKMP SA exists an informational exchange must be protected
+     * by it. Acting on an unprotected delete would let anyone who has seen our cookies on the wire
+     * force an endless renegotiation.
+     */
+    @Test
+    fun `an unprotected informational is ignored once the isakmp sa exists`() {
+        val responder = responder()
+        val negotiator = IkeV1Negotiator(config(), transportFor(responder))
+        val phase1 = negotiator.establishPhase1()
+
+        val spoofed = IsakmpCodec.buildMessage(
+            phase1.initiatorCookie, phase1.responderCookie, ExchangeType.INFORMATIONAL, 0, 0x1234,
+            listOf(
+                DeletePayload(
+                    ProtocolId.ISAKMP,
+                    listOf(Bytes.concat(phase1.initiatorCookie, phase1.responderCookie)),
+                ),
+            ),
+        )
+
+        assertFalse(negotiator.handleInformational(phase1, spoofed).isakmpDeleted)
+    }
+
+    /**
+     * A responder that names a PFS group we never proposed would seed its KEYMAT with a second
+     * Diffie-Hellman secret we do not have, and every ESP packet would then fail its integrity
+     * check with nothing on the wire to explain why.
+     */
+    @Test
+    fun `a responder that answers with an unproposed pfs group is refused`() {
+        val responder = FakeIkeResponder(
+            PRESHARED_KEY, localAddress, remoteAddress, LOCAL_PORT,
+            rewriteEchoedTransform = { transform ->
+                if (transform.transformId == TransformId.KEY_IKE) {
+                    transform
+                } else {
+                    TransformPayload(
+                        transform.number,
+                        transform.transformId,
+                        transform.attributes +
+                            SaAttribute.tv(Phase2Attribute.GROUP_DESCRIPTION, DhGroup.MODP_2048.groupId),
+                    )
+                }
+            },
+        )
+        val negotiator = IkeV1Negotiator(config(), transportFor(responder))
+        val phase1 = negotiator.establishPhase1()
+
+        val error = assertThrows(TunnelException::class.java) { negotiator.establishPhase2(phase1) }
+        assertEquals(TunnelErrorKind.IKE_PROPOSAL_REJECTED, error.kind)
+    }
+
+    /** Same silent black hole, reached through a key exchange rather than a group attribute. */
+    @Test
+    fun `a quick mode answer carrying an unsolicited key exchange is refused`() {
+        val responder = FakeIkeResponder(
+            PRESHARED_KEY, localAddress, remoteAddress, LOCAL_PORT,
+            unsolicitedPhase2KeyExchange = true,
+        )
+        val negotiator = IkeV1Negotiator(config(), transportFor(responder))
+        val phase1 = negotiator.establishPhase1()
+
+        val error = assertThrows(TunnelException::class.java) { negotiator.establishPhase2(phase1) }
+        assertEquals(TunnelErrorKind.IPSEC_SA_FAILED, error.kind)
+    }
+
+    /**
+     * 0xFFFFFFFF is what several stacks send for "no limit". The SA life duration is a raw 32-bit
+     * attribute, so it reads back as -1, and the tunnel schedules its rekey off exactly this number.
+     */
+    @Test
+    fun `a life duration that decodes negative falls back to the one we proposed`() {
+        val responder = FakeIkeResponder(
+            PRESHARED_KEY, localAddress, remoteAddress, LOCAL_PORT,
+            rewriteEchoedTransform = { transform ->
+                val durationType = if (transform.transformId == TransformId.KEY_IKE) {
+                    Phase1Attribute.LIFE_DURATION
+                } else {
+                    Phase2Attribute.SA_LIFE_DURATION
+                }
+                TransformPayload(
+                    transform.number,
+                    transform.transformId,
+                    transform.attributes.map {
+                        if (it.type == durationType) SaAttribute.tlv32(durationType, -1) else it
+                    },
+                )
+            },
+        )
+        val negotiator = IkeV1Negotiator(config(), transportFor(responder))
+
+        val phase1 = negotiator.establishPhase1()
+        assertEquals(config().phase1.lifetimeSeconds, phase1.lifetimeSeconds)
+        assertEquals(config().phase2.lifetimeSeconds, negotiator.establishPhase2(phase1).lifetimeSeconds)
     }
 
     @Test

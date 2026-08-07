@@ -83,6 +83,33 @@ class UdpEncapsulationTest {
     @Test
     fun anEspPacketNeverLooksLikeIke() {
         val esp = espPacket()
-        assertEquals(false, UdpEncapsulation.hasNonEspMarker(esp, 0))
+        assertEquals(false, UdpEncapsulation.hasNonEspMarker(esp, 0, esp.size))
+    }
+
+    /**
+     * The reader thread reuses one buffer for every datagram, so the marker probe has to stop at
+     * the end of the datagram: past it lies whatever the previous packet left behind, and a
+     * zero-filled tail would otherwise be read as a marker that was never received.
+     */
+    @Test
+    fun theMarkerIsNeverSearchedPastTheDatagram() {
+        val buffer = ByteArray(64) // the stale tail of a reused receive buffer, all zeros
+        assertEquals(false, UdpEncapsulation.hasNonEspMarker(buffer, 0, 0))
+        assertEquals(false, UdpEncapsulation.hasNonEspMarker(buffer, 0, 3))
+        assertEquals(true, UdpEncapsulation.hasNonEspMarker(buffer, 0, 4))
+        // Out-of-range slices are never a marker either.
+        assertEquals(false, UdpEncapsulation.hasNonEspMarker(buffer, 62, 4))
+        assertEquals(false, UdpEncapsulation.hasNonEspMarker(buffer, -1, 4))
+    }
+
+    /** A length whose end does not fit in an `Int` must not wrap the range check into a pass. */
+    @Test
+    fun rejectsARangeWhoseEndOverflows() {
+        val esp = espPacket()
+        assertEquals(UdpEncapsulation.Kind.UNKNOWN, UdpEncapsulation.classify(esp, 1, Int.MAX_VALUE))
+        assertEquals(
+            false,
+            UdpEncapsulation.hasNonEspMarker(ByteArray(64), 1, Int.MAX_VALUE),
+        )
     }
 }

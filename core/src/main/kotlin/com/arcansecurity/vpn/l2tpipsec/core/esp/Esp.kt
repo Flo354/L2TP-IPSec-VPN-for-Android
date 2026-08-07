@@ -30,7 +30,10 @@ internal object EspLayout {
     /** Trailer bytes that always follow the padding: pad length and next header. */
     const val TRAILER_SIZE = 2
 
-    /** Sequence numbers are 32-bit unsigned and start at 1 (RFC 4303 section 3.3.3). */
+    /**
+     * Last usable sequence number. They are 32-bit unsigned and start at 1, and RFC 4303 section
+     * 3.3.3 forbids reusing one, so the SA has to be rekeyed rather than wrapped past this.
+     */
     const val MAX_SEQ = 0xFFFFFFFFL
 
     /**

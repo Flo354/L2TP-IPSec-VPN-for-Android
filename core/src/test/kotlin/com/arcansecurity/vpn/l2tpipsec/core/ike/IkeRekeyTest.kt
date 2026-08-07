@@ -10,6 +10,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -119,6 +120,55 @@ class IkeRekeyTest {
         // Neither side may have moved on to a different SA.
         assertEquals(phase2.outboundSpi, responder.inboundSpi)
         assertEquals(phase2.inboundSpi, responder.outboundSpi)
+    }
+
+    /**
+     * A peer that rekeys retires the SA it just replaced, and that delete regularly overtakes the
+     * HASH(3) that closes the rekey. Treating it as "the peer hung up" would kill a healthy tunnel
+     * at the very moment it was being kept alive.
+     */
+    @Test
+    fun `an ipsec delete arriving before HASH(3) does not abort a peer initiated rekey`() {
+        val responder = responder()
+        val transport = transportFor(responder)
+        val negotiator = IkeV1Negotiator(config(), transport)
+        val phase1 = negotiator.establishPhase1()
+        val old = negotiator.establishPhase2(phase1)
+
+        val request = responder.startQuickMode()
+        transport.deliverBeforeNextReply(responder.buildEspDelete(old.outboundSpi))
+
+        val fresh = negotiator.respondToQuickMode(phase1, request)
+        assertNotNull("a delete for the superseded SA must not abort the exchange", fresh)
+        assertMatchingKeymat(responder, fresh!!)
+        assertNotEquals(old.inboundSpi, fresh.inboundSpi)
+    }
+
+    /**
+     * The replay cache is what keeps a peer whose message 2 was lost on a single SA pair, but it
+     * lives as long as the ISAKMP SA does, so it must not grow with every rekey the peer drives.
+     */
+    @Test
+    fun `the cache of answered quick modes stays bounded`() {
+        val responder = responder()
+        val transport = transportFor(responder)
+        val negotiator = IkeV1Negotiator(config(), transport)
+        val phase1 = negotiator.establishPhase1()
+
+        // Nothing comes back once the path is dead, so each exchange simply gives up on its HASH(3).
+        transport.dropOutbound = true
+        val requests = (0 until 6).map { responder.startQuickMode(0x51a10000 + it) }
+        for (request in requests) assertNotNull(negotiator.respondToQuickMode(phase1, request))
+
+        // The four most recent answers are still replayed rather than renegotiated...
+        for (request in requests.drop(2)) assertNull(negotiator.respondToQuickMode(phase1, request))
+
+        // ...while the older ones have been evicted instead of accumulating.
+        assertNotNull(negotiator.respondToQuickMode(phase1, requests[1]))
+        assertNotNull(negotiator.respondToQuickMode(phase1, requests[0]))
+
+        // Evicting two did not empty the cache: the newest answer is still there.
+        assertNull(negotiator.respondToQuickMode(phase1, requests[5]))
     }
 
     @Test
