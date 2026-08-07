@@ -53,6 +53,24 @@ data class Phase1Result(
     val natTraversalFlavor: NatTraversalFlavor,
     val localIdentity: ByteArray,
     val remoteIdentity: ByteArray,
+    /** The lifetime the responder settled on, which is what the rekey schedule must follow. */
+    val lifetimeSeconds: Int,
+)
+
+/**
+ * What a received Informational exchange asked for.
+ *
+ * Deletes have to be reported rather than acted on here, because only the tunnel knows which SAs
+ * are still in use: once rekeying is in play the peer routinely deletes the *previous* IPsec SA,
+ * and treating that as "the tunnel is gone" would tear down a perfectly healthy connection.
+ */
+data class InformationalResult(
+    /**
+     * SPIs the peer is tearing down. RFC 2408 section 3.15 says these are the sender's own inbound
+     * SPIs, so they are the SPIs *we* send on.
+     */
+    val deletedEspSpis: List<Int> = emptyList(),
+    val isakmpDeleted: Boolean = false,
 )
 
 /** One negotiated pair of ESP SAs, one per direction. */

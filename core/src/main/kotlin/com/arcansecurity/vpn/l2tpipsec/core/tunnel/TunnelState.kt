@@ -34,6 +34,10 @@ data class TunnelStats(
     val packetsIn: Long = 0,
     val packetsOut: Long = 0,
     val connectedSinceMs: Long = 0,
+    /** IPsec SAs installed since the tunnel came up, whoever started the exchange. */
+    val ipsecRekeys: Long = 0,
+    /** ISAKMP SAs renegotiated since the tunnel came up. */
+    val ikeRekeys: Long = 0,
 )
 
 /** Categorised failures so the UI can give the user something actionable. */

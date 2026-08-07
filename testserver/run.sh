@@ -42,6 +42,10 @@ docker run -d \
     --ip "$SERVER_IP" \
     --restart=no \
     -e PPP_AUTH="${PPP_AUTH:-any}" \
+    -e IKE_LIFETIME="${IKE_LIFETIME:-8h}" \
+    -e ESP_LIFETIME="${ESP_LIFETIME:-1h}" \
+    -e REKEY="${REKEY:-no}" \
+    -e MARGINTIME="${MARGINTIME:-9m}" \
     -v /lib/modules:/lib/modules:ro \
     "$IMAGE" >/dev/null
 

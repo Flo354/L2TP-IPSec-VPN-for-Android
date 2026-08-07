@@ -211,10 +211,12 @@ class IkeV1NegotiatorTest {
         assertTrue(responder.receivedNotifyTypes.contains(NotifyType.DPD_R_U_THERE))
 
         // A probe from the peer is answered and leaves the SA alive.
-        assertTrue(negotiator.handleInformational(phase1, responder.buildDpdRequest(0x2a)))
+        val probe = negotiator.handleInformational(phase1, responder.buildDpdRequest(0x2a))
+        assertFalse(probe.isakmpDeleted)
+        assertTrue(probe.deletedEspSpis.isEmpty())
         assertTrue(responder.receivedNotifyTypes.contains(NotifyType.DPD_R_U_THERE_ACK))
 
-        assertFalse(negotiator.handleInformational(phase1, responder.buildIsakmpDelete()))
+        assertTrue(negotiator.handleInformational(phase1, responder.buildIsakmpDelete()).isakmpDeleted)
     }
 
     @Test
@@ -226,7 +228,9 @@ class IkeV1NegotiatorTest {
         val tampered = responder.buildIsakmpDelete().copyOf()
         tampered[tampered.size - 1] = (tampered[tampered.size - 1] + 1).toByte()
         // Garbled ciphertext must never be able to tear the tunnel down.
-        assertTrue(negotiator.handleInformational(phase1, tampered))
+        val result = negotiator.handleInformational(phase1, tampered)
+        assertFalse(result.isakmpDeleted)
+        assertTrue(result.deletedEspSpis.isEmpty())
     }
 
     @Test

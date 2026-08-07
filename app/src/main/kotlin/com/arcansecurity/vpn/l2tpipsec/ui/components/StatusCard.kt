@@ -192,6 +192,9 @@ private fun TunnelDetails(info: TunnelInfo, stats: TunnelStats) {
         DetailRow("Phase 1", info.phase1Description)
         DetailRow("Phase 2", info.phase2Description)
         DetailRow("PPP auth", info.pppAuthDescription)
+        // Worth surfacing: a tunnel that has been up for hours should show these climbing. If they
+        // stay at zero past the SA lifetime, the peer is not rekeying the way we expect.
+        DetailRow("Rekeys", "${stats.ipsecRekeys} IPsec · ${stats.ikeRekeys} IKE")
 
         Spacer(Modifier.height(12.dp))
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)

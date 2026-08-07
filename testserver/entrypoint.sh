@@ -91,6 +91,26 @@ awk -v repl="$AUTH_LINES" '
 log "PPP auth offer: PPP_AUTH=$PPP_AUTH -> $(echo "$AUTH_LINES" | tr '\n' ' ')"
 
 # ---------------------------------------------------------------------------
+# 4c. SA lifetimes and who rekeys ($IKE_LIFETIME, $ESP_LIFETIME, $REKEY, $MARGINTIME)
+#     Short lifetimes are what make a rekey observable inside a test that runs
+#     in minutes instead of hours. REKEY=yes additionally makes the *server*
+#     start the Quick Mode, which exercises the client's responder path.
+# ---------------------------------------------------------------------------
+IKE_LIFETIME="${IKE_LIFETIME:-8h}"
+ESP_LIFETIME="${ESP_LIFETIME:-1h}"
+REKEY="${REKEY:-no}"
+MARGINTIME="${MARGINTIME:-9m}"
+sed -i \
+    -e "s/^\( *\)ikelifetime=.*/\1ikelifetime=$IKE_LIFETIME/" \
+    -e "s/^\( *\)lifetime=.*/\1lifetime=$ESP_LIFETIME/" \
+    -e "s/^\( *\)rekey=.*/\1rekey=$REKEY/" \
+    /etc/ipsec.conf
+# margintime has no default line in the shipped config, so add it under %default.
+grep -q '^ *margintime=' /etc/ipsec.conf \
+    || sed -i "s/^\( *\)lifetime=$ESP_LIFETIME/\1lifetime=$ESP_LIFETIME\n\1margintime=$MARGINTIME\n\1rekeyfuzz=0%/" /etc/ipsec.conf
+log "SA lifetimes: ike=$IKE_LIFETIME esp=$ESP_LIFETIME rekey=$REKEY margintime=$MARGINTIME"
+
+# ---------------------------------------------------------------------------
 # 5. runtime dirs / clean state
 # ---------------------------------------------------------------------------
 mkdir -p /var/run/xl2tpd /var/run/pluto /var/log
