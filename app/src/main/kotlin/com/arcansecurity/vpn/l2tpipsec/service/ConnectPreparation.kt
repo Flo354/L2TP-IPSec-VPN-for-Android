@@ -4,8 +4,6 @@ import com.arcansecurity.vpn.l2tpipsec.core.tunnel.Phase1Proposal
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.Phase2Proposal
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.VpnConfig
 import com.arcansecurity.vpn.l2tpipsec.data.VpnProfile
-import com.arcansecurity.vpn.l2tpipsec.ui.profile.dnsServerList
-import com.arcansecurity.vpn.l2tpipsec.ui.profile.localIdentity
 
 /**
  * Turning a saved profile plus the secrets read out of the vault into a [VpnConfig].
@@ -52,32 +50,9 @@ fun prepareConnect(
     }
 
     return try {
-        ConnectPreparation.Ready(
-            VpnConfig(
-                serverHost = profile.server.trim(),
-                presharedKey = String(presharedKey),
-                username = profile.username.trim(),
-                password = password?.let { String(it) } ?: "",
-                exchangeMode = profile.exchangeMode,
-                localIdentity = profile.localIdentity(),
-                phase1 = Phase1Proposal(
-                    encryption = profile.phase1Encryption,
-                    hash = profile.phase1Hash,
-                    dhGroup = profile.phase1DhGroup,
-                ),
-                phase2 = Phase2Proposal(
-                    encryption = profile.phase2Encryption,
-                    integrity = profile.phase2Integrity,
-                    pfsGroup = profile.phase2PfsGroup,
-                ),
-                forceUdpEncapsulation = profile.forceUdpEncapsulation,
-                allowedPppAuth = profile.allowedPppAuth,
-                mtu = profile.mtu,
-                dnsOverride = profile.dnsServerList(),
-                blockIpv6 = profile.blockIpv6,
-                debugLogging = profile.debugLogging,
-            ),
-        )
+        // Delegates rather than repeating the field-by-field mapping: two copies of it drifted
+        // apart once already, and the mapping test guards this one.
+        ConnectPreparation.Ready(profile.toVpnConfig(presharedKey, password ?: CharArray(0)))
     } catch (e: IllegalArgumentException) {
         // VpnConfig's own require() blocks. The form validates the same rules, so reaching this
         // means the profile was written by an older build or edited outside the app.

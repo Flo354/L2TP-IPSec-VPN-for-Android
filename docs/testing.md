@@ -244,10 +244,28 @@ timeout paths be exercised without a test that sleeps.
 | `net` | checksum, IPv4 header, UDP datagram including the zero-checksum case |
 | `ppp` | framing, control packets, MD4, MS-CHAPv2, a full negotiation plus hand-crafted corner cases |
 | `tunnel` | the MTU budget, and the orchestrator's failure handling — a server that never answers, or a socket that dies underneath, must become a bounded, correctly attributed failure rather than a hang or a spin |
-| `:app` | profile conversion and validation, the log ring buffer, the reconnect backoff |
+| `:app` | the persistence layer (profile list, credential vault, schema-1 migration), the form reducer and validator, the secret-field commit rules, profile → `VpnConfig` conversion, start-action dispatch, the log ring buffer, the reconnect backoff |
 
 The orchestrator's *happy* path is not hermetic on purpose — it needs a real server, and that is what
 `LiveServerE2eTest` is for.
+
+### The `:app` persistence tests
+
+Everything in `data/` is exercised against `FakePreferences`, an in-memory `SharedPreferences` that
+can be made to throw `SecurityException` the way the encrypted one does — per key, or wholesale, and
+switchable mid-test so a store can be made to come back to life. `StoreFixture` wires the real
+`PreferenceProfileStore` and `PreferenceSecretVault` over it with `Dispatchers.Unconfined` standing
+in for `Dispatchers.IO`, so the suspending work runs to completion on the calling thread and the
+tests need no scheduler: the ordering guarantees being asserted are the production ones.
+
+The properties worth knowing are pinned there rather than in prose: that a delete wipes the profile's
+credentials, that editing a profile never destroys a secret the user did not touch, that the
+schema-1 migration makes the credentials durable **before** it drops the old plaintext keys, and that
+a store which refuses a write leaves the app working for the session rather than throwing.
+
+**What this cannot cover: `AndroidKeyStore` does not exist on a plain JVM**, so nothing here
+exercises the real `EncryptedSharedPreferences`. There is no `androidTest` source set. See
+[security.md](security.md#what-is-not-claimed).
 
 ## Two knob namespaces
 

@@ -1,6 +1,7 @@
 package com.arcansecurity.vpn.l2tpipsec.ui.profile
 
 import com.arcansecurity.vpn.l2tpipsec.data.SecretKind
+import com.arcansecurity.vpn.l2tpipsec.data.wipe
 import com.arcansecurity.vpn.l2tpipsec.data.SecretVault
 
 /**
@@ -101,24 +102,6 @@ val SecretFieldModel.isEditable: Boolean
  */
 const val STORED_SECRET_PLACEHOLDER: String = "••••••••"
 
-/**
- * Overwrites a secret buffer in place, so a `CharArray` that has been handed to the vault or to the
- * protocol stack does not sit in the heap afterwards waiting for a garbage collector that has no
- * reason to hurry.
- *
- * The scrub value is built with Char(0) rather than written as a character literal, on
- * purpose: an invisible control character inside a literal compiles perfectly, is impossible
- * to spot in review, and turns the whole file into something grep skips as binary. That is not
- * hypothetical — it is how this function was first written, and the only reason it was caught is
- * that its unit test asserted the resulting bytes.
- *
- * This is best effort and no more. Anything that has already become a `String` — which includes
- * everything `VpnConfig` holds and everything a Compose text field renders — cannot be scrubbed at
- * all, because `String` is immutable.
- */
-fun CharArray?.wipe() {
-    this?.fill(SCRUB_VALUE)
-}
 
 /**
  * Carries out one field's [SecretCommit] against the vault, then scrubs [typed].
@@ -148,7 +131,7 @@ fun applySecretCommit(
                 if (typed != null && typed.isNotEmpty()) vault.store(profileId, kind, typed)
         }
     } finally {
-        typed.wipe()
+        typed?.wipe()
     }
 }
 

@@ -191,7 +191,7 @@ fun ProfileFormState.validate(): ValidationResult {
         )
     }
 
-    val badDns = profile.dnsServerList().firstOrNull { !it.matches(IP_LITERAL_PATTERN) }
+    val badDns = profile.dnsServerList.firstOrNull { !it.matches(IP_LITERAL_PATTERN) }
     if (badDns != null) {
         errors += ValidationError(ProfileField.DNS_SERVERS, "'$badDns' is not an IP address")
     }

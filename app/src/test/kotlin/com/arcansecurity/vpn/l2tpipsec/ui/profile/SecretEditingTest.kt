@@ -1,6 +1,7 @@
 package com.arcansecurity.vpn.l2tpipsec.ui.profile
 
 import com.arcansecurity.vpn.l2tpipsec.data.SecretKind
+import com.arcansecurity.vpn.l2tpipsec.data.wipe
 import com.arcansecurity.vpn.l2tpipsec.data.SecretVault
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -154,9 +155,9 @@ class SecretEditingTest {
     }
 
     @Test
-    fun `wiping a null array is a no-op`() {
+    fun `wiping through a nullable reference is a no-op`() {
         val absent: CharArray? = null
-        absent.wipe()
+        absent?.wipe()
     }
 
     // -------------------------------------------------------------------------- the write path

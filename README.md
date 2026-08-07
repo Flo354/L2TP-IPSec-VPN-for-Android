@@ -45,7 +45,7 @@ core/         pure Kotlin/JVM — the whole protocol stack, no Android SDK, unit
   l2tp/         L2TPv2 AVPs, control channel with Ns/Nr and retransmission, data path
   ppp/          LCP, PAP / CHAP-MD5 / MS-CHAPv2 (with its own MD4), IPCP with RFC 1877 DNS
   tunnel/       VpnConfig, platform seams, MTU budgeting, and L2tpIpsecTunnel which drives it all
-app/          Android — VpnService, platform adapters, encrypted profile storage, Compose UI
+app/          Android — VpnService, platform adapters, encrypted profile + credential storage, Compose UI
 testserver/   a real strongSwan + xl2tpd + pppd lab in Docker, driven by the live tests
 ```
 
@@ -74,10 +74,16 @@ Requires the Android SDK (`compileSdk 37`, `minSdk 26`) and a JDK the Gradle wra
 Kotlin Android plugin is deliberately absent from `:app` — AGP supplies Kotlin for Android modules
 itself.
 
-On the device: enter server address, pre-shared key, user name and password, and press Connect. The
-advanced section exposes the phase 1 / phase 2 proposals, exchange mode, local identity, PPP
-authentication list, MTU, DNS override and the IPv6 blackhole. Full field reference in
+On the device: create a profile — server address, pre-shared key, user name and password — and press
+Connect. Several profiles can be saved, with one marked active; they can be edited, duplicated and
+deleted. The advanced section exposes the phase 1 / phase 2 proposals, exchange mode, local identity,
+PPP authentication list, MTU, DNS override and the IPv6 blackhole. Full field reference in
 [docs/configuration.md](docs/configuration.md).
+
+**A saved pre-shared key or password can never be displayed again.** The credentials live in a store
+the UI is handed *without a getter*, so a screen has no way to read one back; a saved field offers
+Replace and Clear rather than a masked value. What that protects against, and what it does not, is in
+[docs/security.md](docs/security.md).
 
 ## Status
 
@@ -91,11 +97,13 @@ target router) and against the real Livebox Pro:
 | PPP authentication | PAP, CHAP-MD5 and MS-CHAPv2 all negotiate and authenticate |
 | Rekeying | both SAs replaced, by us and by the server, without interrupting traffic |
 | Wrong PSK / wrong password | fail fast with distinguishable, actionable errors |
-| Test suite | 358 `:core` tests and 50 `:app` tests, of which 6 need the lab and self-skip without it |
+| Test suite | `:core` and `:app` both green; the handful of live tests self-skip without the lab |
 | Static analysis | `:app:lintDebug` reports no issues; both modules compile without warnings |
+| Credential storage | **not verified on a device** — read-only review plus plain-JVM tests against a fake store, because `AndroidKeyStore` does not exist off-device |
 
 Known limitations are listed honestly in each document, and collected in
-[docs/architecture.md](docs/architecture.md#known-limitations).
+[docs/architecture.md](docs/architecture.md#known-limitations). The credential handling has its own
+honest account in [docs/security.md](docs/security.md#what-is-not-claimed).
 
 ## Documentation
 
@@ -104,8 +112,9 @@ Known limitations are listed honestly in each document, and collected in
 | [docs/architecture.md](docs/architecture.md) | Module layout, the layering, the threading model, the platform seams |
 | [docs/protocol.md](docs/protocol.md) | What is implemented at each layer, with RFCs — and the non-obvious decisions |
 | [docs/rekeying.md](docs/rekeying.md) | SA lifetimes, the jittered deadline, make-before-break, what is not covered |
-| [docs/android.md](docs/android.md) | `VpnService` lifecycle, `protect()`, foreground service, reconnect, the traps |
-| [docs/configuration.md](docs/configuration.md) | Every field of `VpnConfig` and `VpnProfile`: meaning, default, when to change it |
+| [docs/android.md](docs/android.md) | `VpnService` lifecycle, `protect()`, foreground service, profile storage, reconnect, the traps |
+| [docs/configuration.md](docs/configuration.md) | Every field of `VpnConfig` and `VpnProfile`, the two secrets, the validation rules |
+| [docs/security.md](docs/security.md) | What protects the credentials, the threat model, the never-reveal guarantee, and what is not claimed |
 | [docs/testing.md](docs/testing.md) | Hermetic tests, the Docker lab, how to run each suite |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Getting logs off a device, every `TunnelErrorKind`, observed symptoms |
 | [docs/interoperability.md](docs/interoperability.md) | The Livebox Pro's settings, and what the lab taught us about strongSwan and xl2tpd |

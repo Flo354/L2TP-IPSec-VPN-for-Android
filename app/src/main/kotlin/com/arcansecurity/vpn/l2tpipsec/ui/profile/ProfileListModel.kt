@@ -2,7 +2,6 @@ package com.arcansecurity.vpn.l2tpipsec.ui.profile
 
 import com.arcansecurity.vpn.l2tpipsec.data.VpnProfile
 import java.util.Locale
-import java.util.UUID
 
 /** Shown instead of an empty name; also what a blank name is saved as. */
 const val UNTITLED_PROFILE: String = "Untitled profile"
@@ -61,11 +60,10 @@ fun newProfileName(taken: Collection<String>): String {
  * path for the UI. The screen says so rather than letting the user find out when the tunnel fails
  * to authenticate.
  */
-fun duplicateOf(profile: VpnProfile, taken: Collection<String>, id: String = newProfileId()): VpnProfile =
+fun duplicateOf(profile: VpnProfile, taken: Collection<String>, id: String = VpnProfile.newId()): VpnProfile =
     profile.copy(id = id, name = duplicateNameFor(profile.name, taken))
 
 /** Identifier for a new profile; also the key its secrets are filed under in the vault. */
-fun newProfileId(): String = UUID.randomUUID().toString()
 
 private fun String.removeCopySuffix(): String =
     COPY_SUFFIX.replace(this, "").trim().ifBlank { UNTITLED_PROFILE }

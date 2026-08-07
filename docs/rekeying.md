@@ -16,6 +16,7 @@ All of this runs on the maintenance thread — see
 * [Answering a peer-initiated Quick Mode](#answering-a-peer-initiated-quick-mode)
 * [Telling deletes apart](#telling-deletes-apart)
 * [Rekeying the ISAKMP SA](#rekeying-the-isakmp-sa)
+* [Messages for the superseded SA are handed back, not dropped](#messages-for-the-superseded-sa-are-handed-back-not-dropped)
 * [ESP sequence exhaustion](#esp-sequence-exhaustion)
 * [When a rekey fails](#when-a-rekey-fails)
 * [What is deliberately not covered](#what-is-deliberately-not-covered)
@@ -162,6 +163,41 @@ Anything matching neither is dropped with a warning.
 Note that the ESP SAs are **not** children of the ISAKMP SA in any operational sense here — they keep
 working across a phase-1 rekey. That is also true of strongSwan, and the live rekey test asserts it.
 
+## Messages for the superseded SA are handed back, not dropped
+
+A phase-1 rekey runs a **second negotiator on the maintenance thread**, and that thread is the only
+consumer of the inbound ISAKMP queue. So for the few round trips a Main Mode takes, the *new*
+negotiator is the one draining the queue — while the SA it is replacing is still live and the peer is
+still talking to it. Everything arriving for that older SA is addressed to cookies the new negotiator
+does not have and encrypted under keys it cannot derive: a DPD `R-U-THERE`, a Delete, a Quick Mode
+the peer started.
+
+Dropping those is what makes a peer conclude the tunnel is dead. They are parked instead:
+
+```
+IkeTransport.deferForeignMessage(raw)   ─►  deferredIkeQueue (16 slots, in the tunnel)
+```
+
+Four properties make this work, and each is load-bearing:
+
+* **The negotiator recognises them by initiator cookie.** Both wait loops — the general
+  retransmit loop and the one awaiting Quick Mode `HASH(3)` — hand back anything whose initiator
+  cookie is not their own, rather than logging and discarding it.
+* **It is deliberately not the same queue.** Putting a message back on the queue the negotiator is
+  reading would have it read, reject and requeue the same datagram for ever.
+* **The deferred queue is drained first**, ahead of anything still on the normal queue. Those
+  messages arrived earlier, and a Delete must not be applied out of order with the exchange that
+  followed it.
+* **It cannot be drained too early.** The drain runs on the same thread as the rekey, so it cannot
+  possibly run before the new context has been installed — which is what stops a deferred message
+  from being attributed to the SA that was current when it arrived. By the time it runs, the current
+  and previous contexts both name the SA they should, and the ordinary cookie-pair routing applies.
+
+The queue is bounded at 16 datagrams and **drops on overflow rather than blocking**: the only thread
+that empties it is the very thread a rekey is blocking, so waiting for room would deadlock the tunnel
+outright. An overflow logs a warning; a peer would have to be unusually chatty during the handful of
+round trips a Main Mode takes to reach it.
+
 ## ESP sequence exhaustion
 
 RFC 4303 §3.3.3 forbids reusing a sequence number, so the SA has to be replaced *before* the 32-bit
@@ -206,15 +242,10 @@ See [android.md](android.md#the-connectivity-callback-trap).
 **Commit-bit / phase-2 completion handshakes.** The ISAKMP Commit flag is not implemented in either
 direction.
 
-**The peer's messages are dropped for the duration of a phase-1 rekey.** A phase-1 rekey builds a
-fresh negotiator and runs a whole Main Mode on the maintenance thread, which is the thread that would
-otherwise be draining the inbound ISAKMP queue. While it blocks, the new negotiator reads that queue
-itself and discards anything not addressed to its own initiator cookie — including a DPD `R-U-THERE`
-for the still-live old SA, which it could not decrypt anyway since it has no keys for it. The window
-is the few round trips a Main Mode takes, and a peer normally retries DPD several times before
-concluding the tunnel is dead, so this has never been observed to bite. Closing it properly means
-either not blocking that thread or handing foreign messages back to the tunnel to process afterwards;
-neither is worth the risk until a peer is seen to actually give up in that window.
+**Unbounded deferral during a phase-1 rekey.** Messages for the SA being replaced are handed back and
+processed once the rekey finishes (above), but the queue holding them is 16 datagrams deep and drops
+the rest. That is a bounded-buffer decision, not a protocol one; blocking instead would deadlock the
+thread that is supposed to empty it.
 
 ## Verifying it
 

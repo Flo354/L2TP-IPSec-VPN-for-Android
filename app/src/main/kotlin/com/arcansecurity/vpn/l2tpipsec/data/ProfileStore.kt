@@ -68,7 +68,7 @@ val ProfileStore.activeProfile: VpnProfile?
 /**
  * Suspends until the one-shot load has finished, successfully or not.
  *
- * This is how the service gets a profile without the blocking `ProfileRepository.get()` call that
+ * This is how the service gets a profile without the blocking the old blocking profile repository call that
  * used to sit in `onStartCommand`.
  */
 suspend fun ProfileStore.awaitLoaded(): ProfileStoreState =

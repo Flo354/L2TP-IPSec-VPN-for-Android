@@ -131,6 +131,6 @@ class ProfileListModelTest {
 
     @Test
     fun `new ids are unique`() {
-        assertTrue(List(50) { newProfileId() }.toSet().size == 50)
+        assertTrue(List(50) { VpnProfile.newId() }.toSet().size == 50)
     }
 }
