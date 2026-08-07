@@ -86,7 +86,8 @@ UDP-encapsulated transport mode for phase 2, MTU 1400.
 ./gradlew :app:assembleDebug  # APK at app/build/outputs/apk/debug/
 ```
 
-Requires JDK 17+ and the Android SDK (compileSdk 35).
+Requires JDK 21 and the Android SDK (compileSdk 37). Gradle 9.7 and AGP 9.2 — AGP now supplies
+Kotlin for Android modules itself, so the `kotlin-android` plugin is deliberately absent.
 
 ## End-to-end tests against a real server
 
