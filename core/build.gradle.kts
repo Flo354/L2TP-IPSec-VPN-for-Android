@@ -30,15 +30,18 @@ tasks.withType<Test>().configureEach {
     }
     // The end-to-end tests spin up real UDP sockets on loopback.
     systemProperty("java.net.preferIPv4Stack", "true")
-    // Forward the live-server switches so `LiveServerE2eTest` can opt in; without them it skips.
+    // Forward the live-server switches so the end-to-end tests can opt in; without them they skip.
+    // Read through the provider API rather than System.getProperty: that registers them as proper
+    // build inputs instead of silently baking a value in should the configuration cache be turned
+    // on later.
     for (key in listOf(
         "l2tp.test.server", "l2tp.test.psk", "l2tp.test.user", "l2tp.test.password",
         "l2tp.test.rekey", "l2tp.test.rekey.responder",
     )) {
-        System.getProperty(key)?.let { systemProperty(key, it) }
+        providers.systemProperty(key).orNull?.let { systemProperty(key, it) }
     }
     // The live tests are worth watching: surface the tunnel's own trace while they run.
-    if (System.getProperty("l2tp.test.server") != null) {
+    if (providers.systemProperty("l2tp.test.server").isPresent) {
         testLogging.showStandardStreams = true
     }
 }
