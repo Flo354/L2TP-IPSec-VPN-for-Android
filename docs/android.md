@@ -443,16 +443,13 @@ Unknown or unparseable enum values fall back to the default with a warning rathe
 downgrade or a hand-edited store does not brick the app. That is a *parse* failure, not a read
 failure, and it is handled per field.
 
-### The plaintext fallback
+### No keystore, no app
 
-If the keystore refuses to give an encrypted store, `VpnStorage.open` logs a warning and falls back
-to plain private `SharedPreferences` under `vpn-profile`, `ProfileStore.usesEncryptedStorage` becomes
-`false`, and the home screen shows a red banner saying the pre-shared key and password are stored
-unencrypted.
-
-Falling back rather than failing is deliberate: the only screen that could fix a broken keystore is
-the one that would fail to open, and forcing a user to retype a pre-shared key on every restart ends
-with the key written down somewhere worse. The banner makes the trade visible.
+`VpnStorage.open` has no fallback. If the keystore-backed store cannot be opened, `ProfileStore`
+reports `UNREADABLE` and that is terminal: the home screen replaces its whole content with an
+explanation, and `loadConfiguration` refuses to connect rather than start a tunnel with no
+pre-shared key. See [security.md](security.md#there-is-no-fallback-no-keystore-no-app) for why the
+earlier plaintext fallback was removed.
 
 ### The single-profile migration
 
@@ -462,9 +459,10 @@ one forward as a single profile **with both credentials intact**.
 
 The order is the whole difficulty:
 
-1. Read the schema-1 profile — from the encrypted store, or, if that has nothing, from the plaintext
-   fallback file. The second source matters because a device whose keystore has *since started
-   working again* would otherwise open an empty encrypted store and silently lose the user's setup.
+1. Read the schema-1 profile — from the encrypted store, or, if that has nothing, from the
+   `vpn-profile` file that builds with the old plaintext fallback may have written. That second
+   source still matters: those installs have credentials sitting in the clear, and moving them into
+   the encrypted store and then deleting the file is strictly better than leaving them there.
 2. `SecretVault.store` both credentials.
 3. **`flushNow()` — and only a confirmed durable write lets step 4 happen.** If it fails, the profile
    is usable for this session and the migration is retried on the next start.

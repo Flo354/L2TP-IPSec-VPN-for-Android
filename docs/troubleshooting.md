@@ -48,7 +48,7 @@ adb logcat -s L2TP.Service L2TP.Tun      # the Android side
 | `L2TP.ppp` | LCP, authentication, IPCP |
 | `L2TP.UdpSocket` | socket creation, `protect()`, the local address |
 | `L2TP.Tun` | the `VpnService.Builder` result |
-| `L2TP.Profiles` | profile and credential storage: how many profiles loaded, the schema migration, the unencrypted-fallback warning, and any store that refused a read or a write |
+| `L2TP.Profiles` | profile and credential storage: how many profiles loaded, the schema migration, and any store that refused to open, to read or to write |
 
 ### Without a cable
 
@@ -167,7 +167,7 @@ Real symptoms, from the lab and from the target router.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| **A red banner: the pre-shared key and password are stored unencrypted** | The device keystore refused to give an encrypted store, so the app fell back to plaintext private preferences and said so | Nothing to do on the client. If the keystore later starts working, the app reads the fallback file once and brings the profile forward, so the setup is not lost. See [security.md](security.md#the-plaintext-fallback-still-persists-credentials) |
+| **The whole screen is replaced by "the secure credential store is unavailable"** | The keystore-backed store could not be opened or decrypted. There is deliberately no fallback, so this is terminal — the app will not keep a pre-shared key anywhere else | Usually follows a restore onto another device or an OS upgrade that replaced the master key. Reinstalling generates a fresh master key and clears it; the profiles are gone with it. See [security.md](security.md#there-is-no-fallback-no-keystore-no-app) |
 | **A red banner: the saved profiles could not be decrypted and have been cleared** | The master key no longer matches the encrypted store — a restore onto another handset, or some OS upgrades. `EncryptedSharedPreferences` then throws out of *every* getter | The profiles are genuinely gone; enter them again. The store starts persisting from the first successful write. This is `ProfileStoreState.UNREADABLE`, and the failure is all-or-nothing on purpose |
 | **A duplicated profile will not connect: "A pre-shared key is required"** | Duplication copies no credentials, and cannot: they are filed under the original profile's id in a store the UI cannot read | Enter the key and password on the copy. The snackbar says so at duplication time |
 | **The editor shows "no pre-shared key set" on a profile that has one** | `SecretVault.isSet` is only meaningful once the store has left `LOADING` | Should be impossible — the presence map is seeded before the store publishes `READY`. If it happens, that ordering is the thing to look at |

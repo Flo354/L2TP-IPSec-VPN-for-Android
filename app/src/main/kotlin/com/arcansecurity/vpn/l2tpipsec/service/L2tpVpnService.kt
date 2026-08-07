@@ -234,6 +234,16 @@ class L2tpVpnService : VpnService() {
             reject("The profile store did not finish loading")
             return null
         }
+        if (ready == ProfileStoreState.UNREADABLE) {
+            // No fallback exists by design: the credentials live in the keystore-backed store or
+            // nowhere. Connecting would mean either no pre-shared key or one read from somewhere we
+            // refuse to keep it.
+            reject(
+                "The secure credential store is unavailable, so there is no pre-shared key to " +
+                    "connect with. This app does not keep credentials outside the device keystore.",
+            )
+            return null
+        }
 
         val activeId = store.activeProfileId.value
         val profile = store.profiles.value.firstOrNull { it.id == activeId }

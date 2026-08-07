@@ -55,7 +55,6 @@ fun HomeScreen(
     activeProfile: VpnProfile?,
     profileCount: Int,
     storeIsUnreadable: Boolean,
-    usesEncryptedStorage: Boolean,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onEditActive: () -> Unit,
@@ -78,6 +77,22 @@ fun HomeScreen(
             connectedSinceMs = connectedSinceMs,
         )
 
+        // Without the credential store there is nothing to connect with and nowhere to put a
+        // profile, so the rest of the screen is not merely disabled — it is absent. Offering a
+        // Connect button that can only fail, or a form whose Save is guaranteed to be lost, would
+        // read as a bug rather than as the deliberate refusal it is.
+        if (storeIsUnreadable) {
+            Spacer(Modifier.height(16.dp))
+            Warning(
+                "The secure credential store is unavailable, so this app cannot run. It refuses to " +
+                    "keep a pre-shared key or a password anywhere but the device keystore. This " +
+                    "usually follows a restore onto another device or an OS upgrade that replaced " +
+                    "the master key; reinstalling the app normally clears it.",
+            )
+            Spacer(Modifier.height(32.dp))
+            return@Column
+        }
+
         Spacer(Modifier.height(16.dp))
         ConnectButton(
             state = state,
@@ -85,23 +100,6 @@ fun HomeScreen(
             onConnect = onConnect,
             onDisconnect = onDisconnect,
         )
-
-        if (!usesEncryptedStorage) {
-            Spacer(Modifier.height(12.dp))
-            Warning(
-                "This device's keystore is unavailable, so the pre-shared key and password are " +
-                    "stored unencrypted.",
-            )
-        }
-
-        if (storeIsUnreadable) {
-            Spacer(Modifier.height(12.dp))
-            Warning(
-                "The saved profiles could not be decrypted and have been cleared. This happens when " +
-                    "the device's master key is replaced, usually after a restore. Please enter " +
-                    "the settings again.",
-            )
-        }
 
         Spacer(Modifier.height(16.dp))
         if (activeProfile == null) {

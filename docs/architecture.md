@@ -226,14 +226,14 @@ more than the rest of the package put together: **which callers can read a crede
                             ┌───────────▼───────────┐
                             │ LazyPreferences       │
                             │  EncryptedShared-     │
-                            │  Preferences, or the  │
-                            │  plaintext fallback   │
+                            │  Preferences, or      │
+                            │  nothing at all       │
                             └───────────────────────┘
 ```
 
 | Type | Given to | Why it exists |
 | --- | --- | --- |
-| `ProfileStore` | UI and service | The saved connections as `StateFlow`s. Nothing on it blocks and nothing on it throws: loading is a state (`LOADING` / `READY` / `UNREADABLE`), and every mutator is `suspend`. |
+| `ProfileStore` | UI and service | The saved connections as `StateFlow`s. Nothing on it blocks and nothing on it throws: loading is a state (`LOADING` / `READY` / `UNREADABLE`), and every mutator is `suspend`. `UNREADABLE` is terminal: there is no plaintext fallback, so no keystore means no app. |
 | `SecretVault` | **UI only** | Can say a secret exists and can replace or delete one. Has no getter, so no screen can display a stored credential. |
 | `SecretReader` | **service only** | The single read path. `ui/` does not import the type anywhere. |
 | `AppComponents` | both | Wires the three together once per process, off the main thread. It is the only place outside `data/` that names the factory. |

@@ -59,7 +59,6 @@ fun VpnApp(
     val storeState by controller.storeState.collectAsState()
     val profiles by controller.profiles.collectAsState()
     val activeProfileId by controller.activeProfileId.collectAsState()
-    val usesEncryptedStorage by controller.usesEncryptedStorage.collectAsState()
     val editor by controller.editor.collectAsState()
     val saving by controller.saving.collectAsState()
     val message by controller.message.collectAsState()
@@ -133,7 +132,6 @@ fun VpnApp(
                     activeProfile = profiles.firstOrNull { it.id == activeProfileId },
                     profileCount = profiles.size,
                     storeIsUnreadable = storeState == ProfileStoreState.UNREADABLE,
-                    usesEncryptedStorage = usesEncryptedStorage,
                     onConnect = onConnect,
                     onDisconnect = onDisconnect,
                     onEditActive = { controller.openEditor(activeProfileId) },

@@ -449,5 +449,5 @@ Compiled in, listed here so you do not go looking for a setting that does not ex
 | --- | --- |
 | profile schema version | 2 |
 | encrypted preference file | `vpn-profile-encrypted` |
-| plaintext fallback / legacy file | `vpn-profile` |
+| legacy file from builds that had a plaintext fallback | `vpn-profile` (read once, then deleted) |
 | migrated single-profile id | `legacy` |

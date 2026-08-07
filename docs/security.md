@@ -43,7 +43,7 @@ app can read whatever the encryption does.
 | File | Contents |
 | --- | --- |
 | `vpn-profile-encrypted.xml` | the profile rows **and** both credentials, all encrypted; also the two wrapped Tink keysets |
-| `vpn-profile.xml` | the plaintext fallback, used only when the keystore refuses (see below), and the file an old single-profile install may still be sitting in |
+| `vpn-profile.xml` | written only by builds before the fallback was removed. It is read once, its contents are moved into the encrypted store, and it is then deleted |
 
 Credentials are keyed by profile id and kind:
 
@@ -246,20 +246,26 @@ change, with device tests, not folded into a persistence rewrite.
 The suppression is confined to `data/EncryptedPreferences.kt`, which contains nothing else, so it can
 never quietly hide an unrelated deprecation.
 
-### The plaintext fallback still persists credentials
+### There is no fallback: no keystore, no app
 
-When the keystore refuses to give an encrypted store, `VpnStorage.open` falls back to plain private
-`SharedPreferences` — with the pre-shared key and the password unencrypted in the app's private
-directory — logs a warning, and sets `ProfileStore.usesEncryptedStorage` to `false`, which the home
-screen renders as a red banner.
+An earlier version dropped to plain private `SharedPreferences` when the keystore refused, with the
+pre-shared key and the password unencrypted in the app's data directory, and rendered a red banner
+saying so. That has been removed.
 
-The alternative was refusing to persist credentials at all on such a device. That was rejected
-because the only screen that could fix a broken keystore is the one that would fail to open, and
-because forcing a user to retype a pre-shared key on every restart is the kind of friction that ends
-with the key written down somewhere worse. The banner makes the trade visible rather than silent.
+The reasoning for keeping it was that the only screen able to fix a broken keystore is the one that
+would fail to open, and that forcing a user to retype a pre-shared key ends with the key written down
+somewhere worse. The reasoning against it won: a banner does not make cleartext credentials
+acceptable, and the offline-copy row of the threat model above is the one case the encryption exists
+for — a fallback silently deletes that protection precisely when something has already gone wrong
+with the device.
 
-Note what this fallback is *not*: it is not a downgrade attack surface for another app, because UID
-separation still applies. It is a downgrade against the offline-copy row of the threat model only.
+So `VpnStorage.open` has no `catch`. If the keystore-backed store cannot be opened, `ProfileStore`
+reports `UNREADABLE`, the home screen replaces the whole interface with an explanation, and the
+service refuses to connect: there is no pre-shared key it is willing to have read. The state is
+terminal rather than degraded, and a test pins that a store which fails to open does not come back
+`READY`.
+
+Reinstalling normally clears it, since a fresh install generates a fresh master key.
 
 ### StrongBox is not requested
 
