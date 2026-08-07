@@ -1,6 +1,23 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+}
+
+/**
+ * Release signing is read from `keystore.properties`, which is deliberately **not** in the
+ * repository — see `.gitignore`. Without that file the release build is simply unsigned, so a fresh
+ * clone still builds; only whoever holds the key can produce an installable release.
+ *
+ * Expected keys: `storeFile` (absolute path, outside the repo), `storePassword`, `keyAlias`,
+ * `keyPassword`. See `keystore.properties.example`.
+ */
+val keystorePropertiesFile: File = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
 }
 
 android {
@@ -16,8 +33,26 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                // v1 is legacy; v2/v3 are what Android 7+ and 9+ actually verify.
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
+            // Null when there is no keystore.properties: the APK is then built unsigned rather
+            // than the build failing, so cloning the repository is enough to compile it.
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
