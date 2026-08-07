@@ -141,3 +141,8 @@ honest account in [docs/security.md](docs/security.md#what-is-not-claimed).
 
 `testserver/CLIENT_NOTES.md` holds the raw byte-level findings from the lab and is worth reading
 before touching anything on the wire.
+
+## Licence
+
+[MIT](LICENSE). Note the warranty disclaimer that comes with it, and read the provenance note above
+before deciding what that is worth to you.
