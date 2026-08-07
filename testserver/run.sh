@@ -72,7 +72,7 @@ fi
 # ---------------------------------------------------------------------------
 say "Waiting for the server to become ready"
 ready=0
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
     if docker exec "$CONTAINER" sh -c 'ipsec status >/dev/null 2>&1 && ss -lun | grep -q ":1701"'; then
         ready=1; break
     fi

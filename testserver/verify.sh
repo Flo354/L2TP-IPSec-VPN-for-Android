@@ -96,8 +96,8 @@ step "3. UDP/500, UDP/4500 and UDP/1701 are bound"
 LISTEN=$(docker exec "$CONTAINER" ss -lunp 2>/dev/null)
 [ -z "$LISTEN" ] && LISTEN=$(docker exec "$CONTAINER" netstat -lunp 2>/dev/null)
 for p in 500 4500 1701; do
-    if has "$LISTEN" "[:.]$p[[:space:]]"; then
-        who=$(grep -E "[:.]$p[[:space:]]" <<< "$LISTEN" | head -1 | sed 's/.*users:(("\([^"]*\)".*/\1/')
+    if has "$LISTEN" "[:.]${p}[[:space:]]"; then
+        who=$(grep -E "[:.]${p}[[:space:]]" <<< "$LISTEN" | head -1 | sed 's/.*users:(("\([^"]*\)".*/\1/')
         ok "UDP/$p is bound (${who:-?})"
     else
         bad "UDP/$p is NOT bound"

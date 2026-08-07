@@ -129,7 +129,7 @@ ip xfrm policy flush 2>/dev/null
 log "starting strongSwan (charon)..."
 ipsec start
 # wait until charon answers AND starter has pushed conn L2TP-PSK in
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
     ipsec statusall 2>/dev/null | grep -q 'L2TP-PSK' && break
     sleep 0.5
 done
