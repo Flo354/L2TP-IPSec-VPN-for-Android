@@ -438,7 +438,7 @@ class L2tpIpsecTunnel(
             var consecutiveFailures = 0
             while (!stopRequested.get()) {
                 val datagram = try {
-                    sock.receive(buffer, 500).also { consecutiveFailures = 0 }
+                    sock.receive(buffer, READER_TIMEOUT_MS).also { consecutiveFailures = 0 }
                 } catch (e: Exception) {
                     // The socket is closed underneath us on the way out — by the reaper, by the
                     // final shutdown, or by the connect watchdog. A closed descriptor fails
@@ -560,8 +560,9 @@ class L2tpIpsecTunnel(
         device: TunInterface,
     ) {
         var lastStats = clock.nowMs()
+        var lastReported = stats
         while (!stopRequested.get()) {
-            val packet = l2tpQueue.poll(200, TimeUnit.MILLISECONDS)
+            val packet = l2tpQueue.poll(PUMP_POLL_MS, TimeUnit.MILLISECONDS)
             if (packet != null) {
                 when (val received = l2tp.onPacket(packet, 0, packet.size)) {
                     is L2tpTunnel.Received.Data -> deliverPppFrame(packet, received, ppp, device)
@@ -581,8 +582,14 @@ class L2tpIpsecTunnel(
             if (!ppp.isOpen) throw TunnelException(TunnelErrorKind.PPP_FAILED, "PPP went down (phase ${ppp.phase})")
 
             val now = clock.nowMs()
-            if (now - lastStats >= 1_000) {
-                listener.onStats(stats)
+            if (now - lastStats >= STATS_INTERVAL_MS) {
+                // Only when something moved: an idle tunnel would otherwise publish an identical
+                // snapshot every second for as long as it is up, waking whatever observes it.
+                val current = stats
+                if (current != lastReported) {
+                    listener.onStats(current)
+                    lastReported = current
+                }
                 lastStats = now
             }
         }
@@ -684,13 +691,21 @@ class L2tpIpsecTunnel(
                         sendNatKeepalive()
                         lastKeepalive = now
                     }
+                    // Blocks on the queue rather than sleeping a fixed period: an inbound ISAKMP
+                    // message wakes it at once, and otherwise it stays asleep until something is
+                    // genuinely due. The cap is a safety net for an interrupt that never arrives.
+                    val wait = (nextMaintenanceDeadlineMs(lastKeepalive) - clock.nowMs())
+                        .coerceIn(MIN_MAINTENANCE_WAIT_MS, MAX_MAINTENANCE_WAIT_MS)
+                    ikeQueue.poll(wait, TimeUnit.MILLISECONDS)?.let { handleIkeMessage(it) }
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
                 } catch (e: TunnelException) {
                     maintenanceFailure = e
                 } catch (e: Exception) {
                     if (stopRequested.get()) break
                     log.w("maintenance pass failed", e)
                 }
-                runCatching { Thread.sleep(MAINTENANCE_PERIOD_MS) }
             }
             log.d { "maintenance thread finished" }
         }, "l2tp-vpn-maintenance")
@@ -707,30 +722,52 @@ class L2tpIpsecTunnel(
      */
     private fun drainIkeQueue() {
         while (!stopRequested.get()) {
-            val message = deferredIkeQueue.poll() ?: ikeQueue.poll() ?: return
-            val header = try {
-                IsakmpHeader.decode(message)
-            } catch (e: Exception) {
-                log.w("dropping a malformed ISAKMP datagram", e)
-                continue
-            }
-            val context = ike?.takeIf { it.owns(header) } ?: previousIke?.takeIf { it.owns(header) }
-            if (context == null) {
-                log.w("dropping an ISAKMP message for an SA we do not know")
-                continue
-            }
-            try {
-                when (header.exchangeType) {
-                    ExchangeType.INFORMATIONAL -> applyInformational(context, message)
-                    ExchangeType.QUICK_MODE -> answerPeerQuickMode(context, message)
-                    else -> log.w("ignoring an unsolicited exchange of type ${header.exchangeType}")
-                }
-            } catch (e: TunnelException) {
-                throw e
-            } catch (e: Exception) {
-                log.w("could not process an inbound ISAKMP message", e)
-            }
+            handleIkeMessage(deferredIkeQueue.poll() ?: ikeQueue.poll() ?: return)
         }
+    }
+
+    private fun handleIkeMessage(message: ByteArray) {
+        val header = try {
+            IsakmpHeader.decode(message)
+        } catch (e: Exception) {
+            log.w("dropping a malformed ISAKMP datagram", e)
+            return
+        }
+        val context = ike?.takeIf { it.owns(header) } ?: previousIke?.takeIf { it.owns(header) }
+        if (context == null) {
+            log.w("dropping an ISAKMP message for an SA we do not know")
+            return
+        }
+        try {
+            when (header.exchangeType) {
+                ExchangeType.INFORMATIONAL -> applyInformational(context, message)
+                ExchangeType.QUICK_MODE -> answerPeerQuickMode(context, message)
+                else -> log.w("ignoring an unsolicited exchange of type ${header.exchangeType}")
+            }
+        } catch (e: TunnelException) {
+            throw e
+        } catch (e: Exception) {
+            log.w("could not process an inbound ISAKMP message", e)
+        }
+    }
+
+    /**
+     * The next moment the maintenance thread actually has work: a rekey, the retirement of a
+     * superseded SA, or a NAT keepalive.
+     *
+     * Sleeping until then rather than polling on a fixed period is what lets the CPU reach deep
+     * idle. A tunnel that is up but carrying nothing should cost almost nothing, and the keepalive
+     * is the floor the protocol imposes.
+     */
+    private fun nextMaintenanceDeadlineMs(lastKeepaliveMs: Long): Long {
+        var next = lastKeepaliveMs + config.natKeepaliveIntervalMs
+        if (config.rekeyEnabled) {
+            next = minOf(next, phase2RekeyAtMs)
+            ike?.let { next = minOf(next, it.rekeyAtMs) }
+        }
+        if (previousPhase2 != null) next = minOf(next, previousEspExpiresAtMs)
+        if (previousIke != null) next = minOf(next, previousIkeExpiresAtMs)
+        return next
     }
 
     private fun applyInformational(context: IkeContext, message: ByteArray) {
@@ -1108,7 +1145,27 @@ class L2tpIpsecTunnel(
         /** A healthy socket does not fail repeatedly; past this the reader gives up rather than spin. */
         const val MAX_CONSECUTIVE_READ_FAILURES = 16
 
-        const val MAINTENANCE_PERIOD_MS = 250L
+        /**
+         * How long the reader blocks before merely re-checking the stop flag. It can be this long
+         * because what actually unblocks it is the socket being closed, by `stop()` or by the
+         * connect watchdog; the timeout is only a safety net.
+         */
+        const val READER_TIMEOUT_MS = 30_000
+
+        /** Upper bound on a maintenance sleep, so a missed interrupt cannot wedge the thread. */
+        const val MAX_MAINTENANCE_WAIT_MS = 30_000L
+
+        /** Floor, so a deadline that is already in the past cannot turn the loop into a spin. */
+        const val MIN_MAINTENANCE_WAIT_MS = 50L
+
+        /**
+         * Tick granularity for the PPP and L2TP state machines. Their shortest timer is the L2TP
+         * one-second retransmission, so a retransmit can be at most a second late — which no peer
+         * can tell apart from ordinary jitter.
+         */
+        const val PUMP_POLL_MS = 1_000L
+
+        const val STATS_INTERVAL_MS = 1_000L
         const val WATCHDOG_POLL_MS = 200L
 
         /** Floor between two "inbound queue full" warnings; the reader is the hot path. */

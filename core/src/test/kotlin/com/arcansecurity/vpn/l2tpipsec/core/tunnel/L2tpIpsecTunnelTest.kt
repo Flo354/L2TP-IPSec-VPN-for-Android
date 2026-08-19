@@ -83,6 +83,41 @@ class L2tpIpsecTunnelTest {
         ikeMaxRetransmits = 20,
     )
 
+    /** Records the timeout the reader asks for, which is what sets its idle wake rate. */
+    private class TimeoutRecordingChannel : UdpSocketChannel {
+        @Volatile var lastTimeoutMs = 0
+        override val localAddress: InetAddress = InetAddress.getByName("192.0.2.10")
+        override val localPort = 41234
+
+        override fun send(data: ByteArray, offset: Int, length: Int, destination: InetSocketAddress) = Unit
+
+        override fun receive(buffer: ByteArray, timeoutMs: Int): Datagram? {
+            lastTimeoutMs = timeoutMs
+            Thread.sleep(20)
+            return null
+        }
+
+        override fun close() = Unit
+    }
+
+    @Test
+    fun `the reader blocks rather than polling, so an idle tunnel does not wake the cpu`() {
+        // The reader's timeout only exists to re-check the stop flag; what actually unblocks it is
+        // the socket being closed. A short one is a CPU wakeup several times a second for the whole
+        // life of the tunnel, and that - across three loops - is what the app cost in battery.
+        val channel = TimeoutRecordingChannel()
+        val (tunnel, recorder) = run(config(connectTimeoutMs = 1_000), channel)
+        try {
+            recorder.finished.await(15, TimeUnit.SECONDS)
+            assertTrue(
+                "the reader asked for a ${channel.lastTimeoutMs} ms timeout",
+                channel.lastTimeoutMs >= 10_000,
+            )
+        } finally {
+            tunnel.stop()
+        }
+    }
+
     private fun run(config: VpnConfig, channel: UdpSocketChannel): Pair<L2tpIpsecTunnel, Recorder> {
         val recorder = Recorder()
         val tunnel = L2tpIpsecTunnel(
