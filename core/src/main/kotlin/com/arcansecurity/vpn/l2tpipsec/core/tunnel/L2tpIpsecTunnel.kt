@@ -104,6 +104,19 @@ class L2tpIpsecTunnel(
      */
     private val deferredIkeQueue = ArrayBlockingQueue<ByteArray>(16)
 
+    /**
+     * Pushed onto [l2tpQueue] to wake the packet pump for something that is not a packet.
+     *
+     * The pump now sleeps until the PPP and L2TP state machines say they have work, which can be
+     * twenty seconds; without a way to interrupt that, a stop request or a failure raised by the
+     * maintenance thread would sit unnoticed for as long. Matched by identity, so a genuine
+     * zero-length payload cannot be mistaken for it.
+     */
+    private val wakeUp = ByteArray(0)
+
+    /** Last time the counters were published, by whichever thread had just moved them. */
+    private val lastStatsAtMs = AtomicLong()
+
     // Reader-thread state. The overflow warning is rate-limited because the reader is the hot
     // path: one line per dropped datagram is how a log gets to a gigabyte in a minute.
     private var droppedDatagrams = 0L
@@ -239,6 +252,7 @@ class L2tpIpsecTunnel(
         runCatching { tun?.close() }
         uplinkThread?.interrupt()
         maintenanceThread?.interrupt()
+        l2tpQueue.offer(wakeUp)
         // Captured now rather than read from the fields when the reaper fires: two seconds later
         // they may already have been cleared, or in principle repopulated, and the reaper must
         // only ever finish off the socket that was live when the stop was asked for.
@@ -498,6 +512,7 @@ class L2tpIpsecTunnel(
                 }
                 bytesIn.addAndGet(length.toLong())
                 packetsIn.incrementAndGet()
+                maybePublishStats()
                 val l2tpPacket = decapsulated.payload.copyOfRange(udp.payloadOffset, udp.payloadOffset + udp.payloadLength)
                 if (!l2tpQueue.offer(l2tpPacket)) onQueueOverflow("L2TP")
             }
@@ -559,11 +574,15 @@ class L2tpIpsecTunnel(
         ppp: PppSession,
         device: TunInterface,
     ) {
-        var lastStats = clock.nowMs()
-        var lastReported = stats
         while (!stopRequested.get()) {
-            val packet = l2tpQueue.poll(PUMP_POLL_MS, TimeUnit.MILLISECONDS)
-            if (packet != null) {
+            // Sleep until PPP or L2TP actually has something due — an open session with nothing
+            // outstanding is twenty seconds away from its next LCP echo — while an inbound packet
+            // or a `wakeUp` still returns immediately. Ticking on a fixed period instead was most
+            // of what the app cost in battery.
+            val wait = (minOf(l2tp.nextDeadlineMs(), ppp.nextDeadlineMs()) - clock.nowMs())
+                .coerceIn(0L, MAX_PUMP_WAIT_MS)
+            val packet = l2tpQueue.poll(wait, TimeUnit.MILLISECONDS)
+            if (packet != null && packet !== wakeUp) {
                 when (val received = l2tp.onPacket(packet, 0, packet.size)) {
                     is L2tpTunnel.Received.Data -> deliverPppFrame(packet, received, ppp, device)
                     // Reported by throwing rather than by calling the listener from here: one
@@ -580,18 +599,6 @@ class L2tpIpsecTunnel(
             l2tp.tick()
             ppp.failure?.let { throw it }
             if (!ppp.isOpen) throw TunnelException(TunnelErrorKind.PPP_FAILED, "PPP went down (phase ${ppp.phase})")
-
-            val now = clock.nowMs()
-            if (now - lastStats >= STATS_INTERVAL_MS) {
-                // Only when something moved: an idle tunnel would otherwise publish an identical
-                // snapshot every second for as long as it is up, waking whatever observes it.
-                val current = stats
-                if (current != lastReported) {
-                    listener.onStats(current)
-                    lastReported = current
-                }
-                lastStats = now
-            }
         }
         // A clean stop: unwind the stack politely so the server frees its resources immediately.
         runCatching { ppp.terminate("client shutdown") }
@@ -702,6 +709,8 @@ class L2tpIpsecTunnel(
                     break
                 } catch (e: TunnelException) {
                     maintenanceFailure = e
+                    // The pump reports it, and it may be asleep for a while yet.
+                    l2tpQueue.offer(wakeUp)
                 } catch (e: Exception) {
                     if (stopRequested.get()) break
                     log.w("maintenance pass failed", e)
@@ -1005,6 +1014,7 @@ class L2tpIpsecTunnel(
             sock.send(esp, 0, esp.size, natTEndpoint)
             bytesOut.addAndGet(esp.size.toLong())
             packetsOut.incrementAndGet()
+            maybePublishStats()
         }
     }
 
@@ -1106,6 +1116,21 @@ class L2tpIpsecTunnel(
         }
     }
 
+    /**
+     * Publishes the counters at most once a second, from whichever thread has just moved them.
+     *
+     * The pump used to do this on a timer, which meant waking every second for the whole life of
+     * the tunnel to republish an identical snapshot. A counter only changes when a packet moves,
+     * and the thread that moved it is already awake.
+     */
+    private fun maybePublishStats() {
+        val now = clock.nowMs()
+        val last = lastStatsAtMs.get()
+        if (now - last < STATS_INTERVAL_MS) return
+        if (!lastStatsAtMs.compareAndSet(last, now)) return
+        listener.onStats(stats)
+    }
+
     private fun setState(next: TunnelState, detail: String? = null) {
         state = next
         listener.onStateChanged(next, detail)
@@ -1159,11 +1184,10 @@ class L2tpIpsecTunnel(
         const val MIN_MAINTENANCE_WAIT_MS = 50L
 
         /**
-         * Tick granularity for the PPP and L2TP state machines. Their shortest timer is the L2TP
-         * one-second retransmission, so a retransmit can be at most a second late — which no peer
-         * can tell apart from ordinary jitter.
+         * Upper bound on a pump sleep. The pump is normally woken by a packet or by `wakeUp`; this
+         * only bounds how long a lost wake-up could go unnoticed.
          */
-        const val PUMP_POLL_MS = 1_000L
+        const val MAX_PUMP_WAIT_MS = 30_000L
 
         const val STATS_INTERVAL_MS = 1_000L
         const val WATCHDOG_POLL_MS = 200L

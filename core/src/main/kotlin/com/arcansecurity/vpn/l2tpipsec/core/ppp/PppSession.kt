@@ -185,6 +185,39 @@ class PppSession(
     }
 
     /** Retransmissions, LCP echo keepalives, and timeouts. Call a few times a second. */
+    /**
+     * When [tick] would next have something to do, as an absolute [Clock] time, or
+     * [Long.MAX_VALUE] when nothing is pending.
+     *
+     * It exists so the packet pump can sleep until something is genuinely due instead of ticking on
+     * a fixed period: an open session with nothing outstanding has only the LCP echo ahead of it,
+     * twenty seconds away.
+     *
+     * Every branch of [tick] must be represented here, in the same order and under the same
+     * guards. Returning a later time than [tick] would act on delays a retransmission;
+     * [PppDeadlineTest] pins the two together so a new timer cannot be added to one without the
+     * other.
+     *
+     * Call it from the same thread as [tick] — this class is not thread-safe.
+     */
+    fun nextDeadlineMs(): Long {
+        if (phase == Phase.DEAD || phase == Phase.FAILED) return Long.MAX_VALUE
+        // Terminating short-circuits the rest of tick(), so it short-circuits here too.
+        if (phase == Phase.TERMINATE) {
+            return if (terminatePacket == null) Long.MAX_VALUE else terminateNextSendAtMs
+        }
+        var next = Long.MAX_VALUE
+        if (phase != Phase.OPEN) next = minOf(next, deadlineMs)
+        if (lcp.pendingPacket != null) next = minOf(next, lcp.nextSendAtMs)
+        if (ipcp.pendingPacket != null) next = minOf(next, ipcp.nextSendAtMs)
+        if (phase == Phase.AUTHENTICATE) {
+            if (papPacket != null) next = minOf(next, papNextSendAtMs)
+            next = minOf(next, authDeadlineMs)
+        }
+        if (echoesEnabled && lcp.opened) next = minOf(next, lastEchoAtMs + ECHO_INTERVAL_MS)
+        return next
+    }
+
     fun tick() {
         if (phase == Phase.DEAD || phase == Phase.FAILED) return
         val now = clock.nowMs()

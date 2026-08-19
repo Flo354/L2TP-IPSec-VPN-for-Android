@@ -161,6 +161,13 @@ internal class FakeLns(
 
     fun hello(avps: List<L2tpAvp> = emptyList()): ByteArray = emit(L2tpMessageType.HELLO, avps)
 
+    /**
+     * Set-Link-Info, which a peer may send at any time. Unlike StopCCN, CDN and HELLO it is not
+     * acknowledged inside `onPacket`, so it is the way to leave an acknowledgement owed to the
+     * next `tick`.
+     */
+    fun sli(avps: List<L2tpAvp> = emptyList()): ByteArray = emit(L2tpMessageType.SLI, avps)
+
     fun stopCcn(result: Int, error: Int = 0, message: String = ""): ByteArray = emit(
         L2tpMessageType.StopCCN,
         listOf(

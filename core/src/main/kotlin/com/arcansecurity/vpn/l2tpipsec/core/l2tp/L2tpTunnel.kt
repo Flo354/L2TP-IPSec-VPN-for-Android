@@ -247,6 +247,33 @@ class L2tpTunnel(
     }
 
     /** Called periodically; sends HELLO and retransmits unacked control messages. */
+    /**
+     * When [tick] would next have something to do, as an absolute [Clock] time, or
+     * [Long.MAX_VALUE] when nothing is pending.
+     *
+     * It exists so the packet pump can sleep until something is genuinely due instead of ticking on
+     * a fixed period: an established tunnel carrying nothing has only the HELLO ahead of it, a
+     * minute away, and waking the CPU sixty times to discover that is what the battery pays for.
+     *
+     * Every branch of [tick] must be represented here. Returning a later time than [tick] would act
+     * on delays a retransmission; [L2tpDeadlineTest] pins the two together so a new timer cannot be
+     * added to one without the other.
+     *
+     * Call it from the same thread as [tick] — this class is not thread-safe.
+     */
+    fun nextDeadlineMs(): Long {
+        if (terminated) return Long.MAX_VALUE
+        // Mirrors tick()'s flushAck. It is unreachable through onPacket today, which acknowledges
+        // everything it does not hand upstream before returning — but the contract of this method
+        // is to cover every branch of tick(), and keeping the two in step is what stops a future
+        // deferred acknowledgement from sitting unsent while the pump sleeps.
+        if (ackPending) return 0L
+        var next = Long.MAX_VALUE
+        unacked.firstOrNull()?.let { next = minOf(next, it.nextAttemptAtMs) }
+        if (sessionUp) next = minOf(next, helloDueAtMs)
+        return next
+    }
+
     fun tick() {
         if (terminated) return
         val now = clock.nowMs()

@@ -155,6 +155,33 @@ which are explicitly single-threaded — a rekey that ran there could not also s
 echoes. Splitting it out costs one thread and one lock and buys a rekey that is invisible to
 traffic.
 
+### Nothing runs on a fixed period
+
+Every loop waits until something is genuinely due, and none of them polls.
+
+| Thread | Wakes on |
+| --- | --- |
+| packet pump | an inbound L2TP packet, or the earlier of `PppSession.nextDeadlineMs()` and `L2tpTunnel.nextDeadlineMs()` |
+| reader | a datagram; its socket timeout is thirty seconds and exists only as a safety net, since a stop closes the socket |
+| maintenance | an inbound ISAKMP message, or its next rekey, SA retirement or NAT keepalive |
+
+This matters more than it looks. The first version polled at 200 ms, 500 ms and 250 ms respectively
+— eleven CPU wakeups a second for the entire life of a tunnel that might be carrying nothing at all,
+which kept the SoC out of deep idle and was most of what the app cost in battery.
+
+`nextDeadlineMs()` on the two state machines is the load-bearing part, and it carries a real hazard:
+a deadline *later* than the moment `tick()` would act silently delays a retransmission. Both are
+therefore pinned by an invariant test — step the clock finely, and assert nothing is ever sent
+before the deadline last advertised — plus a non-vacuity assertion, because an implementation that
+always answered `Long.MAX_VALUE` would satisfy the invariant while doing nothing. Adding a timer to
+`tick()` without adding it to `nextDeadlineMs()` breaks those tests.
+
+Two loose ends follow from the pump sleeping for up to twenty seconds. A stop request and a failure
+raised by the maintenance thread would otherwise sit unnoticed for as long, so both push a sentinel
+onto the inbound queue to wake it. And the counters can no longer be published on a timer, so they
+are published by whichever thread has just moved one, throttled to once a second — an idle tunnel
+publishes nothing, because nothing changed.
+
 ### Why the connect watchdog exists
 
 Each layer has its own retransmission budget. A peer that answers phase 1 and then goes quiet would
