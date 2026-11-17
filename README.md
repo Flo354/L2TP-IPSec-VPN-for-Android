@@ -119,6 +119,25 @@ report v2 and v3 signatures.
 and reinstall — which wipes the saved profiles and their credentials. Leaking it means anyone can
 sign an update that installs cleanly over yours.
 
+### Release builds from CI
+
+`.github/workflows/release-apk.yml` runs on every push to `master`: the unit tests and an unsigned
+`assembleRelease` in one job, then signing in a second job, then a GitHub release tagged
+`build-<run number>` with the APK attached. The newest one is always at
+<https://github.com/Flo354/L2TP-IPSec-VPN-for-Android/releases/latest/download/L2TP-IPSec-VPN.apk>,
+and its release notes give the signing certificate's SHA-256 so a download can be checked with
+`apksigner verify --print-certs`.
+
+CI signs with a key of its own, not the one above, kept as secrets of a `release` environment that
+only `master` can use. The signing job never runs code from the repository, so a poisoned build
+script, test or dependency has no way to reach the key. Because the keys differ, an APK from CI and
+a local release build will not install over each other.
+
+**Read [docs/release-pipeline.md](docs/release-pipeline.md) before setting it up or changing the
+workflow.** It covers generating the CI key, the three secrets, the repository settings the workflow
+cannot enforce by itself — without them part of the protection does nothing — and the poisoned
+pipeline execution threat model behind every rule.
+
 On the device: create a profile — server address, pre-shared key, user name and password — and press
 Connect. Several profiles can be saved, with one marked active; they can be edited, duplicated and
 deleted. The advanced section exposes the phase 1 / phase 2 proposals, exchange mode, local identity,
@@ -160,6 +179,7 @@ honest account in [docs/security.md](docs/security.md#what-is-not-claimed).
 | [docs/android.md](docs/android.md) | `VpnService` lifecycle, `protect()`, foreground service, profile storage, reconnect, the traps |
 | [docs/configuration.md](docs/configuration.md) | Every field of `VpnConfig` and `VpnProfile`, the two secrets, the validation rules |
 | [docs/security.md](docs/security.md) | What protects the credentials, the threat model, the never-reveal guarantee, and what is not claimed |
+| [docs/release-pipeline.md](docs/release-pipeline.md) | The CI release workflow, its signing key, poisoned pipeline execution and the repository settings that keep the key safe |
 | [docs/testing.md](docs/testing.md) | Hermetic tests, the Docker lab, how to run each suite |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Getting logs off a device, every `TunnelErrorKind`, observed symptoms |
 | [docs/interoperability.md](docs/interoperability.md) | The Livebox Pro's settings, and what the lab taught us about strongSwan and xl2tpd |

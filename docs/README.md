@@ -14,6 +14,7 @@ depth behind it.
 | [android.md](android.md) | `VpnService` lifecycle, why `protect()` matters, foreground service type and permissions, profile and credential storage, the main-thread rules, the reconnect policy, the connectivity-callback trap and the teardown-ordering trap |
 | [configuration.md](configuration.md) | Every field of `VpnConfig` and `VpnProfile`, how the two secrets are addressed and edited, the validation rules, and how a profile becomes a `VpnConfig` |
 | [security.md](security.md) | What is stored where and what actually protects it, the threat model, the never-reveal guarantee and where it still leaks, backup and transfer, the deliberate weaknesses — and what is *not* claimed |
+| [release-pipeline.md](release-pipeline.md) | How a push becomes a signed APK, the dedicated CI key, poisoned pipeline execution and how the workflow is split against it, the GitHub settings it relies on, and the rules for changing it |
 | [testing.md](testing.md) | The test strategy, the Docker lab, how to run each suite including the rekey labs, how the live tests self-skip |
 | [troubleshooting.md](troubleshooting.md) | Getting useful logs off a device, what each `TunnelErrorKind` means, a table of observed symptoms and their causes |
 | [interoperability.md](interoperability.md) | The Livebox Pro's actual settings and how they map onto the client's defaults, plus what the lab taught us about strongSwan, xl2tpd and pppd |
@@ -45,6 +46,10 @@ it is what decides whether any of the improvements listed there are worth doing.
 [security.md](security.md#the-never-reveal-guarantee) first, then
 [configuration.md](configuration.md#the-two-secrets). The rule you will run into is that no type
 reachable from `ui/` can read a stored secret, and that is on purpose.
+
+**"I want to change the release workflow."**
+[release-pipeline.md](release-pipeline.md), all of it. Its rules are what keep the signing key out of
+reach of a poisoned build; the ones that look fussy are the ones that matter.
 
 ## Conventions used here
 
