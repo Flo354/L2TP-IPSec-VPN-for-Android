@@ -37,6 +37,7 @@ tasks.withType<Test>().configureEach {
     for (key in listOf(
         "l2tp.test.server", "l2tp.test.psk", "l2tp.test.user", "l2tp.test.password",
         "l2tp.test.rekey", "l2tp.test.rekey.responder",
+        "l2tp.test.altLocal", "l2tp.test.altServer", "l2tp.test.container",
     )) {
         providers.systemProperty(key).orNull?.let { systemProperty(key, it) }
     }

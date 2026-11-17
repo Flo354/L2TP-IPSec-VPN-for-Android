@@ -140,11 +140,13 @@ Real symptoms, from the lab and from the target router.
 | The peer answers the SCCRQ with a bare **ZLB and nothing else** | A malformed control message. A ZLB is *also* what xl2tpd returns when it ignores a request, so "got a ZLB but no answer" means malformed, not "still thinking" | The Message Type AVP must be **first**; Framing Capabilities and Assigned Tunnel ID must be present |
 | `Peer requested tunnel N twice, ignoring second one` in the server log | A reused Assigned Tunnel ID | The client randomises them per attempt; a probe tool must too |
 | **The reconnect hangs at `L2TP_TUNNEL`** after a previous disconnect, with no error | The router never saw the teardown and is still holding the old session, so it ignores the new SCCRQ | This is the teardown-ordering trap — see [android.md](android.md#the-teardown-ordering-trap). If it has already happened, wait for the router's own timeout |
+| `the LNS did not acknowledge the teardown`, then `keeping the unacknowledged teardown for the next attempt` | The path the tunnel was built on had gone by the time it was closed — a network handover, or the connect watchdog having closed the socket | Expected. The next attempt to the same server logs `re-sending the previous tunnel's teardown` and delivers it through its own SA. See [android.md](android.md#a-teardown-with-nowhere-to-go) |
 
 ### PPP
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
+| **After a network change the reconnect stops at `starting LCP negotiation`**, then `no LCP packet from the peer`, and fails after 30 s with "the peer never sent a single LCP packet"; Disconnect, wait about 30 s, and Connect works | A Livebox that still holds the old session accepts the new L2TP session and never starts PPP on it. The old session's teardown left from a socket whose network had gone, and before the fix every failed or cancelled attempt left one more session behind | Fixed by tearing down every attempt however it ends and by delivering a lost teardown through the next attempt — see [android.md](android.md#a-teardown-with-nowhere-to-go). If it still happens, the log will say whether a rescue was sent |
 | Authentication never starts | The peer offered a protocol not in `allowedPppAuth` and the Nak was not accepted | Widen `allowedPppAuth`, or check the log for which protocol the peer asked for |
 | A stock pppd LNS offers **EAP** | `auth` alone makes pppd offer EAP first; `refuse-eap` does *not* remove it from the offer | The client Naks towards its preferred protocol, which resolves it. On a server you control, use explicit `require-chap` / `require-mschap-v2` / `require-pap` |
 | "loopback detected" | The peer echoed our magic number | Something on the path is reflecting frames; genuinely a looped line |

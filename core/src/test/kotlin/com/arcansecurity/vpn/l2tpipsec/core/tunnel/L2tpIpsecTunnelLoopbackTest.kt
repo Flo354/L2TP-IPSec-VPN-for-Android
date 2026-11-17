@@ -4,14 +4,20 @@ import com.arcansecurity.vpn.l2tpipsec.core.e2e.FakeTun
 import com.arcansecurity.vpn.l2tpipsec.core.e2e.FakeTunProvider
 import com.arcansecurity.vpn.l2tpipsec.core.ike.FakeIkeResponder
 import com.arcansecurity.vpn.l2tpipsec.core.ike.NotifyType
+import com.arcansecurity.vpn.l2tpipsec.core.ike.ProtocolId
 import com.arcansecurity.vpn.l2tpipsec.core.l2tp.L2tpMessageType
 import com.arcansecurity.vpn.l2tpipsec.core.util.ByteReader
 import com.arcansecurity.vpn.l2tpipsec.core.util.VpnLogger
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.After
+import java.net.InetAddress
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import com.arcansecurity.vpn.l2tpipsec.core.ppp.FakeLns as PppPeer
@@ -332,6 +338,136 @@ class L2tpIpsecTunnelLoopbackTest {
         assertTrue(packet.contentEquals(echoed!!))
     }
 
+    // ------------------------------------------------------------------------------- teardown
+
+    /**
+     * A connect that fails after the L2TP session is up used to leave everything it had built on
+     * the server: the IPsec SA, the tunnel, the session. Every automatic retry added another set.
+     */
+    @Test
+    fun `a connect refused at ppp still tears down everything it built`() {
+        val server = FakeVpnServer(PSK, ppp = PppPeer(username = "u", password = "p", refuseCredentials = true))
+        val (tunnel, recorder) = launch(server, rescue = null)
+
+        assertTrue("the tunnel never gave up", recorder.finished.await(30, TimeUnit.SECONDS))
+        assertEquals(TunnelErrorKind.PPP_AUTH_FAILED, recorder.kind)
+        assertTrue(
+            "the LNS never saw the failed session torn down: ${server.controlMessages}",
+            server.controlMessages.containsAll(listOf(L2tpMessageType.CDN, L2tpMessageType.StopCCN)),
+        )
+        assertTrue(
+            "the IPsec and ISAKMP SAs were left on the server",
+            server.responder.receivedDeleteProtocols.containsAll(listOf(ProtocolId.ESP, ProtocolId.ISAKMP)),
+        )
+        assertNull("an acknowledged teardown leaves nothing for the next attempt", tunnel.leftover)
+    }
+
+    /**
+     * Disconnect pressed while PPP is still negotiating — what a user does with a reconnect that
+     * hangs. checkStop() reports that as an InterruptedException, and the teardown has to survive
+     * the interrupt run() re-asserts for it.
+     */
+    @Test
+    fun `a stop while ppp is still negotiating tears down what was built`() {
+        val server = FakeVpnServer(PSK, ppp = peer())
+        server.pppSilent = true
+        val (tunnel, recorder) = launch(server, rescue = null)
+        await("the tunnel never reached PPP") { tunnel.state == TunnelState.PPP_NEGOTIATION }
+
+        tunnel.stop()
+
+        assertTrue("stop() must unblock run()", recorder.finished.await(20, TimeUnit.SECONDS))
+        assertTrue(
+            "the LNS never saw the abandoned session torn down: ${server.controlMessages}",
+            server.controlMessages.containsAll(listOf(L2tpMessageType.CDN, L2tpMessageType.StopCCN)),
+        )
+        assertTrue(server.responder.receivedDeleteProtocols.contains(ProtocolId.ISAKMP))
+        assertNull(tunnel.leftover)
+    }
+
+    /**
+     * The handover. The old tunnel's teardown goes out of a socket whose network has gone, so the
+     * server never hears it and keeps the session; the next attempt, from a new socket, has to
+     * deliver it — the L2TP part inside its own new SA, ahead of its own SCCRQ.
+     */
+    @Test
+    fun `a teardown lost with the network is delivered by the next attempt through its own sa`() {
+        val server = FakeVpnServer(PSK, ppp = peer())
+        val (first, firstRecorder, _) = start(server)
+        val oldIke = server.responder
+
+        server.primaryEndpoint.unreachable = true
+        first.stop()
+        assertTrue(firstRecorder.finished.await(20, TimeUnit.SECONDS))
+        assertFalse("nothing should have reached the server", server.controlMessages.contains(L2tpMessageType.StopCCN))
+        val leftover = first.leftover
+        assertNotNull("a teardown nobody acknowledged must be kept for the next attempt", leftover)
+
+        val endpoint = server.newEndpoint()
+        val (second, recorder) = launch(server, rescue = leftover, socket = endpoint)
+        assertTrue(
+            "the next attempt did not connect: ${recorder.kind} ${recorder.message}",
+            recorder.connected.await(30, TimeUnit.SECONDS),
+        )
+
+        val log = server.controlLog.toList()
+        val oldTunnel = log.first().first
+        val newTunnel = log.last { it.second == L2tpMessageType.SCCRQ }.first
+        assertNotEquals("the second attempt must have opened a tunnel of its own", oldTunnel, newTunnel)
+        val cdn = log.indexOf(oldTunnel to L2tpMessageType.CDN)
+        val stopCcn = log.indexOf(oldTunnel to L2tpMessageType.StopCCN)
+        val sccrq = log.indexOf(newTunnel to L2tpMessageType.SCCRQ)
+        assertTrue("the old tunnel was never closed: $log", cdn >= 0 && stopCcn > cdn)
+        assertTrue("the old tunnel must be closed before the new one is opened: $log", stopCcn < sccrq)
+        assertTrue(
+            "the old SAs were never deleted",
+            oldIke.receivedDeleteProtocols.containsAll(listOf(ProtocolId.ESP, ProtocolId.ISAKMP)),
+        )
+
+        val tun = provider(second)
+        val packet = ipPacket(31)
+        tun.inject(packet)
+        assertNotNull("the new tunnel does not carry traffic", tun.awaitInbound(10_000))
+
+        second.stop()
+        assertTrue(recorder.finished.await(20, TimeUnit.SECONDS))
+        assertNull("a delivered rescue must not be handed on again", second.leftover)
+    }
+
+    @Test
+    fun `a rescue meant for another server is not delivered`() {
+        val server = FakeVpnServer(PSK, ppp = peer())
+        val foreign = TeardownRescue(
+            serverAddress = InetAddress.getByName("198.51.100.1"),
+            l2tpMessages = listOf(ByteArray(12)),
+            isakmpMessages = emptyList(),
+            capturedAtMs = System.currentTimeMillis(),
+        )
+        val (tunnel, recorder) = launch(server, rescue = foreign)
+
+        assertTrue(recorder.connected.await(30, TimeUnit.SECONDS))
+        assertEquals("the LNS received something that was not this attempt's", L2tpMessageType.SCCRQ, server.controlLog.first().second)
+        tunnel.stop()
+        assertTrue(recorder.finished.await(20, TimeUnit.SECONDS))
+        assertNull(tunnel.leftover)
+    }
+
+    @Test
+    fun `a rescue the attempt never got far enough to deliver is handed on`() {
+        val server = FakeVpnServer(PSK, ppp = peer())
+        server.isakmpUnreachable = true
+        val pending = TeardownRescue(
+            serverAddress = InetAddress.getByName(SERVER),
+            l2tpMessages = listOf(ByteArray(12)),
+            isakmpMessages = emptyList(),
+            capturedAtMs = System.currentTimeMillis(),
+        )
+        val (tunnel, recorder) = launch(server, rescue = pending)
+
+        assertTrue("the tunnel never gave up", recorder.finished.await(30, TimeUnit.SECONDS))
+        assertSame(pending, tunnel.leftover)
+    }
+
     // ------------------------------------------------------------------------------- helpers
 
     private fun await(message: String, timeoutMs: Long = 25_000, condition: () -> Boolean) {
@@ -344,6 +480,32 @@ class L2tpIpsecTunnelLoopbackTest {
     }
 
     /** The server's view of the ISAKMP SA the client has started replacing. */
+    /** Starts a tunnel without waiting for it to connect, for the tests that expect it not to. */
+    private fun launch(
+        server: FakeVpnServer,
+        rescue: TeardownRescue?,
+        socket: UdpSocketChannel = server,
+    ): Pair<L2tpIpsecTunnel, Recorder> {
+        val recorder = Recorder()
+        val provider = FakeTunProvider()
+        val tunnel = L2tpIpsecTunnel(
+            config = config(),
+            socketFactory = { socket },
+            tunProvider = provider,
+            listener = recorder,
+            logger = VpnLogger.NONE,
+            rescue = rescue,
+        )
+        providers[tunnel] = provider
+        started += tunnel
+        Thread({ tunnel.run() }, "loopback-launch").apply { isDaemon = true }.start()
+        return tunnel to recorder
+    }
+
+    private val providers = HashMap<L2tpIpsecTunnel, FakeTunProvider>()
+
+    private fun provider(tunnel: L2tpIpsecTunnel): FakeTun = providers.getValue(tunnel).established!!
+
     private fun awaitSupersededSa(server: FakeVpnServer): FakeIkeResponder {
         await("the client never started renegotiating phase 1") { server.supersededResponder != null }
         return server.supersededResponder!!

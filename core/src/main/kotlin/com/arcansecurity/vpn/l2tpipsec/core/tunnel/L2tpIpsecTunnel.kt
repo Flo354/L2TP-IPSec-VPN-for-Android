@@ -51,9 +51,43 @@ class L2tpIpsecTunnel(
     private val listener: TunnelListener = TunnelListener.NONE,
     private val logger: VpnLogger = VpnLogger.NONE,
     private val clock: Clock = Clock.SYSTEM,
+    /** The previous attempt's [leftover], delivered as soon as this one has an IPsec SA. */
+    private val rescue: TeardownRescue? = null,
 ) {
     private val log = Log("Tunnel", logger)
     private val stopRequested = AtomicBoolean(false)
+
+    /**
+     * What the reader thread stops on. Not [stopRequested]: the teardown runs after a stop and
+     * needs the reader for one more round trip, to hear the LNS acknowledge the StopCCN.
+     */
+    private val socketClosing = AtomicBoolean(false)
+
+    /**
+     * Set for the length of [tearDown], so the L2TP transport keeps reading for the
+     * acknowledgement instead of treating the stop flag as an abort.
+     */
+    @Volatile private var tearingDown = false
+
+    // The layers that exist on the server once they are up, kept so that every exit from run()
+    // can take them down again — not only the clean stop of an established tunnel.
+    @Volatile private var l2tpTunnel: L2tpTunnel? = null
+    @Volatile private var pppSession: PppSession? = null
+
+    /** ISAKMP datagrams [sendPoliteIkeTeardown] put on the wire, kept in case they need another route. */
+    @Volatile private var teardownIsakmp: MutableList<ByteArray>? = null
+
+    /** Whether [rescue] has been dealt with — delivered, or discarded as stale or misaddressed. */
+    private var rescueSettled = false
+
+    /**
+     * The part of this attempt's teardown the server never acknowledged, or a [rescue] this
+     * attempt never got far enough to deliver; `null` when there is nothing left to say. Read it
+     * once [run] has returned and hand it to the next attempt's constructor.
+     */
+    @Volatile
+    var leftover: TeardownRescue? = null
+        private set
 
     private val bytesIn = AtomicLong()
     private val bytesOut = AtomicLong()
@@ -234,6 +268,7 @@ class L2tpIpsecTunnel(
                 listener.onFailed(kind, e.message ?: e.javaClass.simpleName, e)
             }
         } finally {
+            tearDown()
             shutdown()
             listener.onDisconnected()
         }
@@ -314,6 +349,8 @@ class L2tpIpsecTunnel(
         )
         checkStop()
 
+        rescue?.let(::deliverRescue)
+
         val tunnelMtu = Mtu.tunnelMtu(Mtu.DEFAULT_PATH_MTU, firstPhase2.encryption, firstPhase2.integrity, config.mtu)
         log.i("negotiated tunnel MTU: $tunnelMtu")
 
@@ -325,6 +362,9 @@ class L2tpIpsecTunnel(
             logger = logger,
             helloIntervalMs = config.l2tpHelloIntervalMs,
         )
+        // Published before connect(): an SCCRQ the LNS has answered is already a tunnel on its
+        // side, and a connect that fails half-way has to close it like any other.
+        l2tpTunnel = l2tp
         val sessionInfo = l2tp.connect(config.connectTimeoutMs)
         setState(TunnelState.L2TP_SESSION)
         log.i(
@@ -343,6 +383,7 @@ class L2tpIpsecTunnel(
             clock = clock,
             logger = logger,
         )
+        pppSession = ppp
         val pppResult = negotiatePpp(l2tp, ppp)
         log.i("PPP up: ${pppResult.localAddress} peer ${pppResult.remoteAddress} dns=${pppResult.dnsServers}")
 
@@ -404,7 +445,7 @@ class L2tpIpsecTunnel(
         while (!stopRequested.get() && clock.nowMs() < deadline) {
             checkSendAborted()
             val packet = l2tpQueue.poll(100, TimeUnit.MILLISECONDS)
-            if (packet != null) {
+            if (packet != null && packet !== wakeUp) {
                 when (val received = l2tp.onPacket(packet, 0, packet.size)) {
                     is L2tpTunnel.Received.Data -> deliverPppFrame(packet, received, ppp, device = null)
                     is L2tpTunnel.Received.Closed ->
@@ -450,7 +491,7 @@ class L2tpIpsecTunnel(
         val thread = Thread({
             val buffer = ByteArray(4096)
             var consecutiveFailures = 0
-            while (!stopRequested.get()) {
+            while (!socketClosing.get()) {
                 val datagram = try {
                     sock.receive(buffer, READER_TIMEOUT_MS).also { consecutiveFailures = 0 }
                 } catch (e: Exception) {
@@ -600,36 +641,126 @@ class L2tpIpsecTunnel(
             ppp.failure?.let { throw it }
             if (!ppp.isOpen) throw TunnelException(TunnelErrorKind.PPP_FAILED, "PPP went down (phase ${ppp.phase})")
         }
-        // A clean stop: unwind the stack politely so the server frees its resources immediately.
-        runCatching { ppp.terminate("client shutdown") }
-        runCatching { l2tp.close() }
-        sendPoliteIkeTeardown()
+        // A clean stop. The polite teardown is run()'s job, because every other way out of here
+        // owes the server one too.
     }
 
     /**
-     * Deletes both the superseded and the current IPsec SA, then the ISAKMP SA.
+     * Unwinds whatever this attempt built on the server, however the attempt ended.
+     *
+     * The failed and abandoned attempts are the ones that matter most, and they used to get
+     * nothing at all: a PPP negotiation that timed out, a password the server refused, a
+     * Disconnect pressed mid-connect — each left an IPsec SA, an L2TP tunnel and a session behind
+     * on the server, and every automatic retry added another. Layers that never came up are
+     * skipped, so this is safe from any exit.
+     *
+     * The order is load-bearing. The L2TP teardown travels inside the IPsec SA, so it has to be
+     * acknowledged, or given up on, before the ISAKMP Deletes take that SA away.
+     */
+    private fun tearDown() {
+        // checkStop() reports a stop by throwing InterruptedException, and run() re-asserts the
+        // interrupt for it, which would make every blocking call below fail on the spot. The
+        // teardown is bounded, so the interrupt can wait for it.
+        val interrupted = Thread.interrupted()
+        tearingDown = true
+        // Raised here too, not only by stop(): a tunnel that failed on its own still has its
+        // maintenance thread running, possibly mid-rekey and holding the negotiator the deletes
+        // need, and its uplink thread still forwarding into a session about to be closed.
+        stopRequested.set(true)
+        runCatching { tun?.close() }
+        uplinkThread?.interrupt()
+        maintenanceThread?.interrupt()
+        try {
+            // A session the LNS has already closed with a CDN has nothing left to carry it.
+            if (l2tpTunnel?.isSessionOpen == true) {
+                pppSession?.let { session -> runCatching { session.terminate("client shutdown") } }
+            }
+            var unacknowledged = emptyList<ByteArray>()
+            l2tpTunnel?.let { l2tp ->
+                runCatching {
+                    l2tp.close(if (state == TunnelState.FAILED) "abandoning a failed connection attempt" else "client shutdown")
+                }
+                // A socket the connect watchdog has already closed cannot carry an answer, so
+                // waiting for one would only spend the reaper's grace period.
+                val acknowledged = stalledIn == null &&
+                    runCatching { l2tp.awaitTeardownAcknowledged(TEARDOWN_ACK_WAIT_MS) }.getOrDefault(false)
+                if (!acknowledged) unacknowledged = l2tp.unacknowledgedTeardown()
+            }
+            val isakmp = sendPoliteIkeTeardown()
+            leftover = when {
+                rescue != null && !rescueSettled -> rescue
+                unacknowledged.isNotEmpty() -> TeardownRescue(serverAddress, unacknowledged, isakmp, clock.nowMs())
+                else -> null
+            }
+            leftover?.let { log.i("keeping the unacknowledged teardown for the next attempt: $it") }
+        } finally {
+            tearingDown = false
+            if (interrupted) Thread.currentThread().interrupt()
+        }
+    }
+
+    /**
+     * Deletes both the superseded and the current IPsec SA, then the ISAKMP SA, and returns the
+     * datagrams that carried them so a teardown the server never acknowledged can be sent again.
      *
      * The wait for the negotiator is bounded: a rekey holds it for as long as its retransmission
      * budget lasts, and blocking here for that long would push the Delete out after the reaper had
      * already closed the socket — which is the whole failure the grace period exists to avoid,
      * since a peer that never sees it keeps the dead session and ignores the next SCCRQ.
      */
-    private fun sendPoliteIkeTeardown() {
-        val context = ike ?: return
+    private fun sendPoliteIkeTeardown(): List<ByteArray> {
+        val context = ike ?: return emptyList()
         val acquired = runCatching { ikeLock.tryLock(TEARDOWN_LOCK_WAIT_MS, TimeUnit.MILLISECONDS) }
             .getOrDefault(false)
         if (!acquired) {
             log.w("a rekey still holds the negotiator; leaving without sending the ISAKMP deletes")
-            return
+            return emptyList()
         }
+        val sent = mutableListOf<ByteArray>()
+        teardownIsakmp = sent
         try {
             runCatching {
                 previousPhase2?.let { context.negotiator.sendEspDelete(context.phase1, it.inboundSpi) }
                 context.negotiator.sendDeleteNotifications(context.phase1, phase2)
             }
         } finally {
+            teardownIsakmp = null
             ikeLock.unlock()
         }
+        return sent
+    }
+
+    /**
+     * Sends what the previous attempt could not get acknowledged through this attempt's own path,
+     * before asking the LNS for a tunnel of its own.
+     *
+     * The L2TP messages go first and inside the new SA, because they are the ones that free the
+     * session; the ISAKMP Deletes then retire the old SAs. Two copies, because nothing will
+     * acknowledge them — the LNS answers the address the old tunnel came from — and a duplicate
+     * costs the LNS one ZLB. The pause afterwards gives it time to reap the old session before our
+     * ICCN asks it to start PPP again.
+     */
+    private fun deliverRescue(pending: TeardownRescue) {
+        rescueSettled = true
+        val age = clock.nowMs() - pending.capturedAtMs
+        if (pending.serverAddress != serverAddress || age !in 0..RESCUE_MAX_AGE_MS) {
+            // Past that age the server has given up on the old session by itself, and a StopCCN
+            // naming a tunnel id it may since have handed to someone else is not ours to send.
+            log.i("discarding the previous tunnel's unacknowledged teardown: it is for another server or ${age / 1000}s old")
+            return
+        }
+        log.i(
+            "re-sending the previous tunnel's teardown, which the server never acknowledged " +
+                "(${pending.l2tpMessages.size} L2TP, ${pending.isakmpMessages.size} ISAKMP messages)",
+        )
+        val transport = ikeTransport
+        repeat(RESCUE_COPIES) { copy ->
+            if (copy > 0) clock.sleep(RESCUE_COPY_GAP_MS)
+            pending.l2tpMessages.forEach { message -> runCatching { sendL2tpPayload(message) } }
+            pending.isakmpMessages.forEach { message -> runCatching { transport?.sendIsakmp(message) } }
+        }
+        clock.sleep(RESCUE_SETTLE_MS)
+        checkStop()
     }
 
     /**
@@ -1077,6 +1208,9 @@ class L2tpIpsecTunnel(
         }
 
         override fun sendIsakmp(message: ByteArray) {
+            // Recorded before anything can fail: a Delete the socket refused is exactly the one
+            // that has to go out again on the next attempt.
+            teardownIsakmp?.add(message.copyOf())
             checkSendAborted()
             if (natTraversal) {
                 val marker = UdpEncapsulation.NON_ESP_MARKER
@@ -1111,8 +1245,10 @@ class L2tpIpsecTunnel(
         }
 
         override fun receive(timeoutMs: Int): ByteArray? {
-            checkReceiveAborted()
-            return l2tpQueue.poll(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            // The teardown is the one reader that runs after the stop flag is up, by design.
+            if (!tearingDown) checkReceiveAborted()
+            // The pump's wake-up sentinel is not a packet; to anyone else it is just a timeout.
+            return l2tpQueue.poll(timeoutMs.toLong(), TimeUnit.MILLISECONDS)?.takeUnless { it === wakeUp }
         }
     }
 
@@ -1150,6 +1286,7 @@ class L2tpIpsecTunnel(
         // maintenance thread for good, waking every 250 ms to poll a socket that is already shut.
         stopRequested.set(true)
         connectSettled.set(true)
+        socketClosing.set(true)
         runCatching { tun?.close() }
         runCatching { socket?.close() }
         tun = null
@@ -1161,11 +1298,35 @@ class L2tpIpsecTunnel(
     }
 
     private companion object {
-        /** How long the socket outlives a stop request so the teardown messages can leave. */
-        const val SHUTDOWN_GRACE_MS = 2_000L
+        /**
+         * How long the socket outlives a stop request so the teardown can complete. It has to
+         * cover the wait for the StopCCN's acknowledgement plus the wait for the negotiator.
+         */
+        const val SHUTDOWN_GRACE_MS = 3_000L
+
+        /**
+         * How long the teardown waits for the LNS to acknowledge the StopCCN. A live path answers
+         * in one round trip; one that is gone never will, and the next attempt delivers instead.
+         */
+        const val TEARDOWN_ACK_WAIT_MS = 1_000
 
         /** How long the teardown waits for a rekey to let go of the negotiator. */
         const val TEARDOWN_LOCK_WAIT_MS = 500L
+
+        /**
+         * The oldest teardown worth delivering late. Comfortably longer than the dead-peer
+         * detection we have seen configured — pppd's LCP echoes, xl2tpd's HELLO and charon's DPD
+         * all give up within three minutes with the lab's settings — so past it the server has
+         * dropped the session by itself, and a StopCCN could only name a tunnel id it has reused.
+         */
+        const val RESCUE_MAX_AGE_MS = 300_000L
+
+        /** How often [deliverRescue] sends it, and how far apart; nothing acknowledges a rescue. */
+        const val RESCUE_COPIES = 2
+        const val RESCUE_COPY_GAP_MS = 200L
+
+        /** Time for the LNS to reap the old session before the new ICCN asks it to start PPP. */
+        const val RESCUE_SETTLE_MS = 1_000L
 
         /** A healthy socket does not fail repeatedly; past this the reader gives up rather than spin. */
         const val MAX_CONSECUTIVE_READ_FAILURES = 16

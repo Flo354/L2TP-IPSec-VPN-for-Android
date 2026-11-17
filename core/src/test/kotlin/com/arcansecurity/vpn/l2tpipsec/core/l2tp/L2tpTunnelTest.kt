@@ -45,6 +45,12 @@ internal class FakeLns(
     var dropFirst: Int = 0,
 ) : L2tpTransport {
 
+    /**
+     * Records what the client sends and answers nothing, like an LNS the network in between has
+     * just disappeared from.
+     */
+    var deaf = false
+
     class Message(val header: L2tpHeader, val type: L2tpMessageType?, val avps: List<L2tpAvp>) {
         val isZlb: Boolean get() = avps.isEmpty()
     }
@@ -93,6 +99,7 @@ internal class FakeLns(
             assertEquals("the Message Type AVP must come first", L2tpAvpType.MessageType, avps.first().avpType)
         }
 
+        if (deaf) return
         if (dropped < dropFirst) {
             dropped++
             return
@@ -128,7 +135,8 @@ internal class FakeLns(
                 assertEquals(1L, avps.requireAvp(L2tpAvpType.FramingType, "ICCN").asU32())
             }
 
-            L2tpMessageType.HELLO -> outbound += zlb()
+            // A real LNS acknowledges the teardown like anything else; xl2tpd answers both with a ZLB.
+            L2tpMessageType.HELLO, L2tpMessageType.CDN, L2tpMessageType.StopCCN -> outbound += zlb()
 
             else -> Unit
         }
@@ -734,5 +742,91 @@ class L2tpTunnelTest {
         val sent = lns.received.size
         tunnel.close("again")
         assertEquals(sent, lns.received.size)
+    }
+
+    @Test
+    fun `close waits for the lns to acknowledge the teardown and leaves nothing behind`() {
+        val lns = FakeLns(clock)
+        val tunnel = tunnel(lns)
+        tunnel.connect(timeoutMs = 10_000)
+
+        tunnel.close("user disconnected")
+
+        assertTrue(tunnel.awaitTeardownAcknowledged(1_000))
+        assertTrue(tunnel.unacknowledgedTeardown().isEmpty())
+        assertEquals(1, lns.count(L2tpMessageType.StopCCN))
+    }
+
+    @Test
+    fun `an unanswered teardown is retransmitted in order and handed back intact`() {
+        val lns = FakeLns(clock)
+        val tunnel = tunnel(lns)
+        tunnel.connect(timeoutMs = 10_000)
+        tunnel.onPacket(lns.zlb()) // the LNS acknowledges the ICCN, as it would once the call is up
+        lns.deaf = true
+        val before = lns.received.size
+
+        tunnel.close("network gone")
+        assertFalse(tunnel.awaitTeardownAcknowledged(1_000))
+
+        val sent = lns.received.drop(before).filterNot { it.isZlb }
+        assertTrue("the teardown was never retransmitted: ${sent.map { it.type }}", sent.size >= 4)
+        // Every round resends the whole queue, CDN first: a StopCCN that overtook it would be
+        // ahead of the Ns the LNS expects, and xl2tpd drops those.
+        sent.chunked(2).forEach { round ->
+            assertEquals(listOf(L2tpMessageType.CDN, L2tpMessageType.StopCCN), round.map { it.type })
+        }
+
+        val leftover = tunnel.unacknowledgedTeardown().map { L2tpCodec.parseHeader(it).first }
+        assertEquals(2, leftover.size)
+        assertTrue(leftover.all { it.isControl && it.tunnelId == lns.tunnelId })
+        assertEquals(lns.sessionId, leftover[0].sessionId)
+        assertEquals(0, leftover[1].sessionId)
+        assertEquals((leftover[0].ns + 1) and 0xFFFF, leftover[1].ns)
+        assertEquals("the leftover must still acknowledge everything the LNS sent", lns.ns, leftover[1].nr)
+    }
+
+    @Test
+    fun `a teardown behind a lost message resends that message first and is then accepted`() {
+        val lns = FakeLns(clock)
+        val tunnel = tunnel(lns, helloIntervalMs = 5_000)
+        tunnel.connect(timeoutMs = 10_000)
+        tunnel.onPacket(lns.zlb())
+        lns.deaf = true
+        clock.advance(5_000)
+        tunnel.tick() // a HELLO goes out into the void
+        tunnel.close("network gone")
+
+        val queued = tunnel.unacknowledgedTeardown()
+        assertEquals(
+            listOf(L2tpMessageType.HELLO, L2tpMessageType.CDN, L2tpMessageType.StopCCN),
+            queued.map { packet ->
+                val (header, offset) = L2tpCodec.parseHeader(packet)
+                L2tpCodec.parseAvps(packet, offset, header.payloadLength)
+                    .find(L2tpAvpType.MessageType)?.let { L2tpMessageType.of(it.asU16()) }
+            },
+        )
+
+        // The network comes back: an LNS that takes control messages strictly in order must now
+        // accept all three, which is what makes the StopCCN take effect at all.
+        lns.deaf = false
+        val expectedNr = lns.nr
+        queued.forEach { lns.send(it) }
+        assertEquals("the LNS must have taken all three in order", (expectedNr + 3) and 0xFFFF, lns.nr)
+        assertTrue(tunnel.awaitTeardownAcknowledged(1_000))
+    }
+
+    @Test
+    fun `a tunnel closed before the lns answered has nothing to tear down`() {
+        val lns = FakeLns(clock)
+        lns.deaf = true
+        val tunnel = tunnel(lns)
+        assertThrows(TunnelException::class.java) { tunnel.connect(timeoutMs = 2_000) }
+
+        tunnel.close("gave up")
+
+        assertTrue(tunnel.unacknowledgedTeardown().isEmpty())
+        assertTrue(tunnel.awaitTeardownAcknowledged(1_000))
+        assertEquals(0, lns.count(L2tpMessageType.StopCCN))
     }
 }

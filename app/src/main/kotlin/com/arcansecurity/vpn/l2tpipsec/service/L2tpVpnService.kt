@@ -16,6 +16,7 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.L2tpIpsecTunnel
+import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TeardownRescue
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelErrorKind
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelException
 import com.arcansecurity.vpn.l2tpipsec.core.tunnel.TunnelInfo
@@ -428,6 +429,7 @@ class L2tpVpnService : VpnService() {
             tunProvider = tunProvider,
             listener = listener,
             logger = logger,
+            rescue = pendingRescue.getAndSet(null),
         )
         tunnel = instance
 
@@ -455,6 +457,7 @@ class L2tpVpnService : VpnService() {
                 Attempt.Failed(TunnelErrorKind.INTERNAL, t.message ?: t.toString())
             }
         } finally {
+            instance.leftover?.let(pendingRescue::set)
             tunnel = null
             socketFactory = null
             runCatching { factory.closeAll() }
@@ -722,7 +725,18 @@ class L2tpVpnService : VpnService() {
          * How long the sockets outlive a stop request so the polite teardown can leave. Must be
          * longer than the tunnel's own grace period, since this is only the backstop.
          */
-        private const val SOCKET_CLOSE_GRACE_MS = 3_000L
+        private const val SOCKET_CLOSE_GRACE_MS = 4_000L
+
+        /**
+         * A teardown the server never acknowledged, waiting for the next attempt to deliver it.
+         *
+         * Process-wide rather than per worker: after a handover the next attempt is the same
+         * worker's, but a Disconnect pressed on a stuck reconnect ends the worker, and the Connect
+         * that follows — which is when the router most needs to hear it — starts a new one, possibly
+         * on a new instance of this service. The tunnel itself refuses one that is stale or meant
+         * for a different server.
+         */
+        private val pendingRescue = AtomicReference<TeardownRescue?>(null)
 
         /**
          * How long the worker waits for the store to leave `LOADING`. Generous, because always-on

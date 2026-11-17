@@ -33,8 +33,8 @@ data class L2tpSessionInfo(
  * "incoming" one from the LNS's point of view, which is why establishment uses ICRQ and not OCRQ.
  *
  * The instance is not thread-safe. [connect] blocks on the transport; afterwards [onPacket] and
- * [tick] must be driven from the same packet-pump thread. [close] is the one exception and only
- * ever appends to the send path.
+ * [tick] must be driven from the same packet-pump thread, and [close] and
+ * [awaitTeardownAcknowledged] from whichever thread owns it once that pump has stopped.
  */
 class L2tpTunnel(
     private val transport: L2tpTransport,
@@ -52,6 +52,9 @@ class L2tpTunnel(
     @Volatile
     var info: L2tpSessionInfo? = null
         private set
+
+    /** Whether the session can still carry PPP: established, and closed by neither end since. */
+    val isSessionOpen: Boolean get() = sessionUp
 
     private var localTunnelId = 0
     private var remoteTunnelId = 0
@@ -288,38 +291,121 @@ class L2tpTunnel(
         flushAck()
     }
 
-    /** Sends CDN then StopCCN. Best effort. */
+    /**
+     * Sends CDN then StopCCN. Best effort, and it returns at once: [awaitTeardownAcknowledged]
+     * is what finds out whether the LNS actually heard them.
+     *
+     * Both are queued behind anything still unacknowledged rather than sent on their own. The
+     * control channel is a reliable in-order stream, and an LNS drops a message whose Ns is ahead
+     * of the one it expects — xl2tpd does, silently — so a StopCCN that overtakes a lost ICRQ or
+     * HELLO is a StopCCN that never takes effect.
+     */
     fun close(reason: String = "client shutdown") {
         if (terminated) return
         terminated = true
         log.i("closing the L2TP tunnel: $reason")
+        if (!controlConnectionUp) {
+            // Without an SCCRP there is no LNS tunnel id to address a StopCCN to; a half-open
+            // tunnel on the LNS side times out on its own.
+            unacked.clear()
+            return
+        }
         // Each leg is attempted on its own: a failed CDN must not cost us the StopCCN.
         if (sessionUp) {
-            bestEffort {
-                transmitOnce(
-                    L2tpMessageType.CDN,
-                    listOf(
-                        resultCode(CDN_ADMINISTRATIVE),
-                        L2tpAvp.u16(L2tpAvpType.AssignedSessionId, localSessionId),
-                    ),
-                    sessionId = remoteSessionId,
-                )
-            }
+            queueTeardown(
+                L2tpMessageType.CDN,
+                listOf(
+                    resultCode(CDN_ADMINISTRATIVE),
+                    L2tpAvp.u16(L2tpAvpType.AssignedSessionId, localSessionId),
+                ),
+                sessionId = remoteSessionId,
+            )
         }
-        if (controlConnectionUp) {
-            bestEffort {
-                transmitOnce(
-                    L2tpMessageType.StopCCN,
-                    listOf(
-                        L2tpAvp.u16(L2tpAvpType.AssignedTunnelId, localTunnelId),
-                        resultCode(STOPCCN_GENERAL_REQUEST),
-                    ),
-                )
-            }
-        }
+        queueTeardown(
+            L2tpMessageType.StopCCN,
+            listOf(
+                L2tpAvp.u16(L2tpAvpType.AssignedTunnelId, localTunnelId),
+                resultCode(STOPCCN_GENERAL_REQUEST),
+            ),
+        )
         sessionUp = false
         controlConnectionUp = false
-        unacked.clear()
+    }
+
+    /**
+     * Waits up to [timeoutMs] for the LNS to acknowledge everything [close] left outstanding,
+     * retransmitting it all in order meanwhile, and reports whether it did.
+     *
+     * This is the difference between a teardown and a hope. A StopCCN the LNS never sees leaves it
+     * holding the session — and the PPP link, and whatever per-user state hangs off that — until
+     * its own keepalives give up, which is minutes, and a Livebox in that state has been seen to
+     * accept the next attempt's session and never start PPP on it. Knowing the answer is what lets
+     * the caller deliver the teardown some other way.
+     *
+     * Reads [L2tpTransport.receive] itself, so it must only be called once nothing else is
+     * pumping packets into [onPacket].
+     */
+    fun awaitTeardownAcknowledged(timeoutMs: Int): Boolean {
+        if (unacked.isEmpty()) return true
+        val deadline = clock.nowMs() + timeoutMs
+        var resendAtMs = clock.nowMs() + TEARDOWN_RETRANSMIT_MS
+        while (unacked.isNotEmpty()) {
+            val now = clock.nowMs()
+            if (now >= deadline) break
+            if (now >= resendAtMs) {
+                unacked.forEach { pending -> bestEffort { transmit(pending) } }
+                resendAtMs = now + TEARDOWN_RETRANSMIT_MS
+            }
+            val waitMs = (minOf(deadline, resendAtMs) - now).coerceAtLeast(1L)
+            val packet = try {
+                transport.receive(waitMs.toInt())
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            } catch (e: Exception) {
+                log.d { "stopped waiting for the teardown to be acknowledged: ${e.message}" }
+                break
+            } ?: continue
+            onTeardownPacket(packet)
+        }
+        val acknowledged = unacked.isEmpty()
+        if (acknowledged) {
+            log.i("the LNS acknowledged the teardown")
+        } else {
+            log.w("the LNS did not acknowledge the teardown within $timeoutMs ms (${unacked.joinToString { it.type.name }})")
+        }
+        return acknowledged
+    }
+
+    /**
+     * Every control message the LNS has not acknowledged, encoded ready to send, oldest first;
+     * empty once [awaitTeardownAcknowledged] has succeeded.
+     *
+     * An LNS identifies a control connection by its tunnel id — xl2tpd looks a tunnel up by that
+     * alone, never by the address a message came from — so these stay deliverable after the
+     * network underneath has changed, through the IPsec SA of the next attempt. That is the only
+     * way left to tell a router that a tunnel whose network vanished has gone.
+     */
+    fun unacknowledgedTeardown(): List<ByteArray> = unacked.map { pending ->
+        L2tpCodec.encodeControl(remoteTunnelId, pending.sessionId, pending.ns, nr, pending.avps)
+    }
+
+    /** What [awaitTeardownAcknowledged] does with a packet: take the acknowledgement, answer the rest. */
+    private fun onTeardownPacket(packet: ByteArray) {
+        val (header, payloadOffset) = try {
+            L2tpCodec.parseHeader(packet, 0, packet.size)
+        } catch (e: ProtocolException) {
+            return
+        }
+        if (!header.isControl) return
+        val avps = try {
+            L2tpCodec.parseAvps(packet, payloadOffset, header.payloadLength, tunnelSecret)
+        } catch (e: ProtocolException) {
+            return
+        }
+        // A StopCCN from the LNS crossing ours ends the conversation as surely as an ack would:
+        // handleControl clears the queue for it.
+        if (handleControl(header, avps) is ControlOutcome.Message) flushAck()
     }
 
     /** Largest PPP frame that fits given the payload budget available to the data message. */
@@ -493,16 +579,20 @@ class L2tpTunnel(
         transmit(pending)
     }
 
-    /** Sends a control message without arming a retransmission; used for the teardown. */
-    private fun transmitOnce(type: L2tpMessageType, avps: List<L2tpAvp>, sessionId: Int = 0) {
+    /**
+     * [sendControl] for the teardown: the message is queued and owed an acknowledgement like any
+     * other, but a send that fails is not allowed to throw. The network is often already gone by
+     * the time a tunnel is being closed, and the message must still be there to retransmit — or to
+     * hand on through [unacknowledgedTeardown].
+     */
+    private fun queueTeardown(type: L2tpMessageType, avps: List<L2tpAvp>, sessionId: Int = 0) {
         val full = ArrayList<L2tpAvp>(avps.size + 1)
         full += L2tpAvp.u16(L2tpAvpType.MessageType, type.code)
         full += avps
-        val packet = L2tpCodec.encodeControl(remoteTunnelId, sessionId, ns, nr, full)
+        val pending = PendingControl(ns, sessionId, type, full)
         ns = (ns + 1) and SEQ_MASK
-        ackPending = false
-        log.d { "-> $type (unacknowledged)" }
-        transport.send(packet, 0, packet.size)
+        unacked.addLast(pending)
+        bestEffort { transmit(pending) }
     }
 
     /** (Re)encodes with the current Nr so a retransmission also refreshes the acknowledgement. */
@@ -582,6 +672,13 @@ class L2tpTunnel(
 
         const val MAX_BACKOFF_SHIFT = 4
         const val MAX_BACKOFF_MS = 16_000L
+
+        /**
+         * Retransmission period while waiting for the teardown to be acknowledged. Far shorter
+         * than the normal one, because the whole wait is bounded by a second or so and a single
+         * lost datagram should still get a second chance inside it.
+         */
+        const val TEARDOWN_RETRANSMIT_MS = 300L
 
         const val STOPCCN_GENERAL_REQUEST = 1
         const val CDN_ADMINISTRATIVE = 3

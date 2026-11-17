@@ -423,9 +423,14 @@ rejects the client on framing grounds.
 ### Teardown
 
 `CDN` for the session, then `StopCCN` for the control connection, each attempted independently so a
-failed CDN does not cost the StopCCN, and neither is retransmitted. Getting these out is what stops
-the router keeping a stale session; see
-[android.md](android.md#the-teardown-ordering-trap).
+failed CDN does not cost the StopCCN. Both are queued behind anything still unacknowledged — an LNS
+drops a control message whose Ns is ahead of the one it expects, so a StopCCN that overtook a lost
+HELLO would never take effect — and the whole queue is retransmitted in order every 300 ms until the
+LNS acknowledges it or a second has passed. Whatever is still unacknowledged then can be encoded
+again for delivery through a different IPsec SA, because the LNS names the tunnel by its id and not
+by the address it came from. Getting these out is what stops the router keeping a stale session;
+see [android.md](android.md#the-teardown-ordering-trap) and
+[android.md](android.md#a-teardown-with-nowhere-to-go).
 
 ## PPP
 

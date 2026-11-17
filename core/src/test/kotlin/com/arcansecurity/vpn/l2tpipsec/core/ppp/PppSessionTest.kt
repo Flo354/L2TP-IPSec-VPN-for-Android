@@ -810,4 +810,46 @@ class PppSessionTest {
         assertEquals(PppSession.Phase.FAILED, client.phase)
         assertEquals(TunnelErrorKind.PPP_FAILED, client.session.failure!!.kind)
     }
+
+    // ------------------------------------------------------------------ a peer that never starts PPP
+
+    /**
+     * An LNS that set up the L2TP session and never started pppd on it — a Livebox still holding
+     * an earlier session does exactly this. Total silence has to read differently in the log from
+     * a peer that negotiates and disagrees, or the two get debugged the same way.
+     */
+    @Test
+    fun `a peer that never sends a single lcp packet is reported as not having started ppp`() {
+        val harness = PppHarness()
+        harness.session.start()
+        repeat(40) {
+            harness.clock.advance(1_000)
+            harness.session.tick()
+            harness.fromClient.clear() // nothing ever reaches the peer, nothing ever comes back
+        }
+
+        val failure = harness.session.failure
+        assertNotNull("ten unanswered Configure-Requests must fail the session", failure)
+        assertEquals(TunnelErrorKind.PPP_FAILED, failure!!.kind)
+        assertTrue(failure.message, failure.message!!.contains("never sent a single LCP packet"))
+    }
+
+    @Test
+    fun `a peer that said anything at all gets the ordinary lcp failure`() {
+        val harness = PppHarness()
+        harness.session.start()
+        harness.session.onFrame(
+            PppProtocol.LCP,
+            PppControlPacket(PppCode.DISCARD_REQUEST, 1, ByteArray(4)).encode(),
+        )
+        repeat(40) {
+            harness.clock.advance(1_000)
+            harness.session.tick()
+            harness.fromClient.clear()
+        }
+
+        val failure = harness.session.failure
+        assertNotNull(failure)
+        assertTrue(failure!!.message, failure.message!!.contains("LCP did not answer"))
+    }
 }

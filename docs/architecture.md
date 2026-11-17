@@ -122,8 +122,8 @@ flowchart LR
 
 | Thread | Owner | Job | Ends when |
 | --- | --- | --- | --- |
-| the caller's thread | `:app`'s `l2tp-tunnel` worker | Runs the whole connect sequence, then becomes the **downlink pump**: dequeues L2TP packets, drives `L2tpTunnel` and `PppSession`, writes IP packets to the TUN, and finally sends the polite teardown. | `run()` returns |
-| `l2tp-vpn-reader` | tunnel | The only reader of the socket. Classifies each datagram and pushes it onto `ikeQueue` (32 slots) or `l2tpQueue` (256 slots). Decrypts ESP, demultiplexing on the SPI. | stop requested, socket closed, or too many consecutive read failures |
+| the caller's thread | `:app`'s `l2tp-tunnel` worker | Runs the whole connect sequence, then becomes the **downlink pump**: dequeues L2TP packets, drives `L2tpTunnel` and `PppSession`, writes IP packets to the TUN, and finally — from `run()`'s `finally`, whichever way the attempt ended — sends the polite teardown and waits for the LNS to acknowledge it. | `run()` returns |
+| `l2tp-vpn-reader` | tunnel | The only reader of the socket. Classifies each datagram and pushes it onto `ikeQueue` (32 slots) or `l2tpQueue` (256 slots). Decrypts ESP, demultiplexing on the SPI. | socket closed, or too many consecutive read failures — deliberately not the stop flag, since the teardown still needs it to hear the StopCCN acknowledged |
 | `l2tp-vpn-uplink` | tunnel | Blocking-reads the TUN, wraps each IP packet in PPP + L2TP + UDP + ESP and sends it. | TUN closed (which is how it is unblocked) |
 | `l2tp-vpn-maintenance` | tunnel | Owns everything ISAKMP once the tunnel is up: drains the deferred queue and then `ikeQueue`, runs both rekey schedules, retires superseded SAs, sends NAT keepalives. | stop requested or a maintenance failure |
 | `l2tp-vpn-connect-watchdog` | tunnel | Bounds the *whole* establishment, not just individual layers. Closes the socket if `CONNECTED` is not reached before `connectTimeoutMs`, recording which state stalled. | `CONNECTED` reached, or the deadline fires |
@@ -198,8 +198,9 @@ full in [android.md](android.md#the-teardown-ordering-trap); in summary:
 
 1. `stop()` sets the flag and **closes the TUN** — that is what unblocks the uplink thread, whose
    read no timeout will ever interrupt.
-2. The socket is deliberately **left open** so the pump can still push PPP Terminate, L2TP
-   CDN/StopCCN and the ISAKMP Deletes out of it.
+2. The socket is deliberately **left open** so the run thread can still push PPP Terminate, L2TP
+   CDN/StopCCN and the ISAKMP Deletes out of it, and hear the StopCCN acknowledged. What it could
+   not get acknowledged becomes `leftover`, for the next attempt to deliver.
 3. The transports handed to the negotiating layers turn a stop request or an expired connect
    deadline into an exception on *receive*, while still allowing *sends* — otherwise a layer sitting
    in its own retransmission loop would keep retransmitting into a socket nobody reads.

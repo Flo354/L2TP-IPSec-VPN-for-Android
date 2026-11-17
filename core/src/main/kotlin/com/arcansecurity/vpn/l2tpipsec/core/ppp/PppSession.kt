@@ -114,6 +114,13 @@ class PppSession(
     private var peerMru = DEFAULT_MRU
     private var lcpWasOpen = false
 
+    /**
+     * Whether the peer has sent a single LCP packet. A peer that never does has not started PPP at
+     * all, which is a different failure from one that negotiates and disagrees, and the log has
+     * to be able to tell them apart.
+     */
+    private var lcpHeardFromPeer = false
+
     // IPCP options we ask for; all start as 0.0.0.0 so the peer fills them in with a Configure-Nak.
     private var localAddress = ByteArray(4)
     private var remoteAddress = ByteArray(4)
@@ -265,6 +272,7 @@ class PppSession(
     }
 
     private fun handleLcp(packet: PppControlPacket) {
+        lcpHeardFromPeer = true
         when (packet.code) {
             PppCode.CONFIGURE_REQUEST -> onLcpConfigureRequest(packet)
 
@@ -911,13 +919,30 @@ class PppSession(
     private fun tickConfigureRequest(n: Negotiation, now: Long, name: String): Boolean {
         val packet = n.pendingPacket ?: return true
         if (now < n.nextSendAtMs) return true
+        val silentPeer = n === lcp && !lcpHeardFromPeer
         if (n.tries >= MAX_CONFIGURE_REQUESTS) {
-            fail(TunnelErrorKind.PPP_FAILED, "$name did not answer $MAX_CONFIGURE_REQUESTS Configure-Requests")
+            fail(
+                TunnelErrorKind.PPP_FAILED,
+                if (silentPeer) {
+                    "the peer never sent a single LCP packet in reply to $MAX_CONFIGURE_REQUESTS Configure-Requests: " +
+                        "the LNS accepted the L2TP session but never started PPP on it, typically because " +
+                        "it still holds an earlier session"
+                } else {
+                    "$name did not answer $MAX_CONFIGURE_REQUESTS Configure-Requests"
+                },
+            )
             return false
         }
         n.tries++
         n.nextSendAtMs = now + RESTART_TIMER_MS
-        log.d { "retransmitting the $name Configure-Request (try ${n.tries})" }
+        // The first retransmission is routine — the LNS often starts PPP a moment after the ICCN
+        // and drops what arrives before — but total silence is worth one line at the default
+        // level: otherwise the log shows nothing at all for the thirty seconds this takes to fail.
+        if (silentPeer && n.tries == SILENT_PEER_LOG_TRY) {
+            log.i("no LCP packet from the peer after ${(n.tries - 1) * RESTART_TIMER_MS / 1000}s; still retransmitting")
+        } else {
+            log.d { "retransmitting the $name Configure-Request (try ${n.tries})" }
+        }
         send(n.protocol, packet)
         return true
     }
@@ -1037,6 +1062,9 @@ class PppSession(
         /** RFC 1661 "Restart timer". */
         private const val RESTART_TIMER_MS = 3_000L
         private const val MAX_CONFIGURE_REQUESTS = 10
+
+        /** The Configure-Request try on which a peer that has said nothing at all gets logged. */
+        private const val SILENT_PEER_LOG_TRY = 3
 
         /** RFC 1661 "Max-Failure", the point at which a Configure-Nak exchange has stopped converging. */
         private const val MAX_CONFIGURE_NAKS = 5

@@ -339,6 +339,45 @@ So the ordering is:
 `:core` has its own version of the same grace period; the service's is deliberately the longer of the
 two, since it is only the backstop.
 
+### Every attempt is torn down, however it ends
+
+The teardown used to run only when an *established* tunnel was stopped. Every other way out — a PPP
+negotiation that timed out, a password the server refused, Disconnect pressed while the reconnect
+was still negotiating, the connect watchdog firing — went straight to closing the socket and left
+an IPsec SA, an L2TP tunnel and a session on the server. Every automatic retry added another.
+
+`L2tpIpsecTunnel.run()` now tears down from its `finally`, for whatever layers had come up: PPP
+Terminate if the session is still open, CDN/StopCCN if the LNS ever answered an SCCRQ, then the
+ISAKMP Deletes. The StopCCN is no longer fire-and-forget either: it is retransmitted every 300 ms
+until the LNS acknowledges it, for at most a second, and only then do the Deletes take the SA it
+travels in away. The reader thread therefore stops on the socket closing, not on the stop flag —
+otherwise it would stop listening exactly when the acknowledgement arrives.
+
+### A teardown with nowhere to go
+
+A handover breaks even a perfect teardown. By the time the platform reports that Wi-Fi has gone, the
+old tunnel's goodbye has no path left to the router: the socket is bound to no network, so it either
+fails or leaves through mobile data from an address the router has no SA for. The router keeps the
+session until its own dead-peer detection gives up, which is minutes. A Livebox in that state has
+been seen to accept the next attempt's L2TP session and never start PPP on it — the log stops at
+`starting LCP negotiation`, and the user's experience is "after a while it disconnects, will not
+reconnect, and works again if I cancel and wait".
+
+None of those messages is tied to the address it was first sent from. xl2tpd finds a control
+connection by its tunnel id alone, and charon an ISAKMP SA by its cookies. So a teardown the LNS
+did not acknowledge is kept — the unacknowledged L2TP control messages, oldest first, and the
+encrypted ISAKMP Deletes — as a `TeardownRescue`, which the service hands to the next attempt to the
+same server. That attempt sends it as soon as its own IPsec SA is up and before its own SCCRQ: the
+L2TP part inside the new SA, the ISAKMP part as it is, twice, then a one-second pause for the LNS to
+reap the old session. It is process-wide rather than per worker, because the attempt that most needs
+it may be a fresh Connect after the user gave up on a stuck reconnect.
+
+Three guards keep it from saying something stale: it is only ever delivered to the server address
+it came from, never once it is more than five minutes old, and an attempt that never got far enough
+to deliver it hands it on unchanged. Against the lab, a rescue sent from a different source address
+closes the stale tunnel in xl2tpd, and charon moves the superseded IKE SA onto the new endpoint and
+deletes it without disturbing the new SA — see `LiveTeardownTest` in [testing.md](testing.md).
+
 ## The reconnect policy
 
 Kept free of Android types so it unit-tests on a plain JVM.

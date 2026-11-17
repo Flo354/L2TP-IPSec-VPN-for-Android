@@ -71,6 +71,13 @@ read-only, and creates `/dev/net/tun` and `/dev/ppp` itself if the runtime did n
 also disables reverse-path filtering — leaving `rp_filter` on is the classic reason L2TP/IPsec
 silently fails inside a container.
 
+A Docker daemon that itself runs inside a user namespace (rootless Docker, or a daemon remapping
+container root to an unprivileged range) cannot let the container create `/dev/ppp`, privileged or
+not, and `--userns=host` does not help. The entrypoint then logs `mknod: /dev/ppp: Operation not
+permitted`, pppd exits the moment xl2tpd starts it, and every session is answered with a CDN
+("loss of carrier") right after the ICCN. IKE, ESP and L2TP still work, so `LiveTeardownTest`
+holds there; anything that needs PPP to come up does not.
+
 If you run the tests from inside another container, the verification client is started as a
 **sibling**, so the capture directory must exist at the same path on the docker host.
 
@@ -100,7 +107,7 @@ a successful ping to the LNS — for MS-CHAPv2, CHAP-MD5 and PAP, plus one run w
 
 ## Live tests
 
-Two classes in `core/src/test/.../core/e2e`, both opt-in.
+Three classes in `core/src/test/.../core/e2e`, all opt-in.
 
 ### `LiveServerE2eTest`
 
@@ -113,6 +120,27 @@ Two classes in `core/src/test/.../core/e2e`, both opt-in.
 
 The MTU assertion is the one to keep an eye on: the lab deliberately advertises an MRU **below** the
 client's own header budget, so this test is what catches a regression in the MRU clamp.
+
+### `LiveTeardownTest`
+
+| Test | What it proves |
+| --- | --- |
+| a failed attempt has its teardown acknowledged by the real LNS | an attempt that dies after its L2TP session is up still sends CDN/StopCCN, and xl2tpd acknowledges them, so nothing is left for a rescue |
+| a teardown lost with the network is delivered by the next attempt | the handover: the first attempt's socket is unplugged the moment its L2TP session exists, its teardown goes nowhere and is kept, and the next attempt — from another source address — delivers it. With `l2tp.test.container` set it also reads xl2tpd's log and asserts the stale tunnel was closed |
+
+Neither needs PPP, so both run on a lab whose pppd cannot start. For the second attempt to really
+come from elsewhere it needs a second network: Docker masquerades one bridge's address on its way
+into another, so the attempt also has to go to the server's address on the new bridge.
+
+```bash
+docker network create --subnet 172.29.0.0/16 --gateway 172.29.0.1 l2tplab2
+docker network connect --ip 172.29.0.10 l2tplab2 l2tp-server
+./gradlew :core:test -Dl2tp.test.server=172.28.0.10 -Dl2tp.test.altLocal=172.29.0.1 \
+    -Dl2tp.test.altServer=172.29.0.10 -Dl2tp.test.container=l2tp-server --tests '*LiveTeardownTest'
+```
+
+charon's own log is worth reading after it: the superseded IKE SA is moved onto the new endpoint
+by the rescued Delete, then deleted, without disturbing the new SA that shares its selectors.
 
 ### Running them
 
@@ -185,8 +213,11 @@ A blank property counts as absent, so `-Dl2tp.test.server=` does not accidentall
 | `l2tp.test.password` | `VpnPass123` | |
 | `l2tp.test.rekey` | `false` | the client-initiated rekey test |
 | `l2tp.test.rekey.responder` | `false` | the server-initiated rekey test |
+| `l2tp.test.altLocal` | none | a second local address for the handover in `LiveTeardownTest` |
+| `l2tp.test.altServer` | none | the server's address on that second network |
+| `l2tp.test.container` | none | the lab container, whose xl2tpd log `LiveTeardownTest` then checks |
 
-Exactly these six properties are forwarded from the Gradle JVM into the test JVM; nothing is read
+Exactly these nine properties are forwarded from the Gradle JVM into the test JVM; nothing is read
 from OS environment variables on the JVM side.
 
 ### Test doubles the live tests use
